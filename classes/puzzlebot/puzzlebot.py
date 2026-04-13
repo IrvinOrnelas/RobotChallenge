@@ -64,15 +64,10 @@ class PuzzleBot:
         self.model = model
         self.arm = arm
 
-        # Estado base: [x, y, theta]
         self.pose = np.array([0.0, 0.0, 0.0])
 
-        # Velocidades actuales
-        self.omega = np.array([0.0, 0.0])  # [wr, wl]
+        self.omega = np.array([0.0, 0.0])
 
-    # -------------------------------------------------
-    # Control
-    # -------------------------------------------------
 
     def set_wheel_speeds(self, omega):
         omega = np.array(omega)
@@ -82,19 +77,11 @@ class PuzzleBot:
         omega = self.model.inverse_kinematics([v, w])
         self.set_wheel_speeds(omega)
 
-    # -------------------------------------------------
-    # Simulación (step)
-    # -------------------------------------------------
-
     def step(self, dt):
         """
         Avanza el estado del robot
         """
         self.pose = self.model.integrate(self.pose, self.omega, dt)
-
-    # -------------------------------------------------
-    # Transformaciones
-    # -------------------------------------------------
 
     def base_to_world(self, p_base):
         x, y, theta = self.pose
@@ -115,10 +102,6 @@ class PuzzleBot:
         """
         p_arm = self.arm.p
         return self.base_to_world(p_arm)
-
-    # -------------------------------------------------
-    # Debug / estado
-    # -------------------------------------------------
 
     def get_state(self):
         return {

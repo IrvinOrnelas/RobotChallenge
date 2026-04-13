@@ -71,11 +71,6 @@ class HuskyModel:
         }
 
 class Husky:
-    """
-    Instancia física (o simulada) del Husky A200.
-    Puede tener un LiDAR montado como componente opcional.
-    """
-
     def __init__(self, pose=(0.0, 0.0, 0.0), s=1.0):
         self.model = HuskyModel()
         self.pose  = np.array(pose, dtype=float)
@@ -85,32 +80,21 @@ class Husky:
         self._omega_meas = np.zeros(4)
         self.log         = []
 
-        # Sensor — None hasta que se monte uno
         self.lidar: LiDAR | None = None
 
     def attach_lidar(self, lidar: LiDAR):
-        """Monta un LiDAR en el robot."""
         lidar.attach(self)
         self.lidar = lidar
 
     def scan(self, obstacles):
-        """
-        Dispara el LiDAR si está montado.
-        Lanza RuntimeError si no hay sensor.
-        """
         if self.lidar is None:
             raise RuntimeError("No hay LiDAR montado. Llama attach_lidar() primero.")
         return self.lidar.scan(obstacles)
 
     def detect_boxes(self, obstacles):
-        """Devuelve centroides de cajas detectadas por el LiDAR."""
         if self.lidar is None:
             raise RuntimeError("No hay LiDAR montado. Llama attach_lidar() primero.")
         return self.lidar.get_detected_boxes(obstacles)
-
-    # ------------------------------------------------------------------
-    # El resto sin cambios
-    # ------------------------------------------------------------------
 
     def set_slip(self, s):
         self.s = float(np.clip(s, 0.0, 1.0))
