@@ -1,354 +1,158 @@
+"""
+classes/puzzlebot/puzzlebot_arm.py
+3-DOF PuzzleBot arm — FK, IK, Jacobian, force-torque mapping
+"""
 import numpy as np
-import time
+from utils import clamp, norm2
+
 
 class PuzzleBotArmModel:
-    def __init__(self, l1=0.10, l2=0.08, l3=0.06):
+    """
+    Geometric model of the 3-DOF revolute arm.
+      q1 : base rotation (horizontal, full 360°)
+      q2 : shoulder (±90°)
+      q3 : elbow   (±90°)
+    Link lengths: l1 (base height), l2 (upper arm), l3 (forearm)
+    """
+    def __init__(self, l1: float = 0.10, l2: float = 0.08, l3: float = 0.06):
         self.l1 = l1
         self.l2 = l2
         self.l3 = l3
+        self.q_limits = [
+            (-np.pi, np.pi),          # q1: full rotation
+            (-np.pi/2, np.pi/2),      # q2: ±90°
+            (-np.pi/2, np.pi/2),      # q3: ±90°
+        ]
 
-    def forward_kinematics(self, q=None):
-        if q is None:
-            return None
-
-        q1, q2, q3 = q
-
-        s1 = np.sin(q1)
-        c1 = np.cos(q1)
-
-        s2  = np.sin(q2)
-        c2  = np.cos(q2)
-
-        s23 = np.sin(q2 + q3)
-        c23 = np.cos(q2 + q3)
-
-        r = self.l2 * c2 + self.l3 * c23
-
-        x = r * c1
-        y = r * s1
-        z = self.l1 + self.l2 * s2 + self.l3 * s23
-
+    # ── FORWARD KINEMATICS ──────────────────────────────────────────────────
+    def forward_kinematics(self, q1: float, q2: float, q3: float) -> np.ndarray:
+        """
+        Joint angles → end-effector position [x, y, z].
+        q1 controls horizontal rotation, q2/q3 vertical reach.
+        """
+        r = self.l2 * np.cos(q2) + self.l3 * np.cos(q2 + q3)
+        x = r * np.cos(q1)
+        y = r * np.sin(q1)
+        z = self.l1 + self.l2 * np.sin(q2) + self.l3 * np.sin(q2 + q3)
         return np.array([x, y, z])
 
-    def inverse_kinematics(self, p=None):
-        if p is None:
-            return None
-
-        x, y, z = p
-
-        r  = np.sqrt(x**2 + y**2)
-        z_ = z - self.l1
-
-        c3 = (r**2 + z_**2 - self.l2**2 - self.l3**2) / (2 * self.l2 * self.l3)
-        c3 = np.clip(c3, -1.0, 1.0)
-        s3 = np.sqrt(1 - c3**2)
-
-        q3 = np.arctan2(s3, c3)
-        q2 = np.arctan2(z_, r) - np.arctan2(self.l3 * s3, self.l2 + self.l3 * c3)
+    # ── INVERSE KINEMATICS ──────────────────────────────────────────────────
+    def inverse_kinematics(self, x: float, y: float, z: float):
+        """
+        Target position → joint angles using geometric method.
+        Returns (q1, q2, q3) or None if unreachable.
+        """
         q1 = np.arctan2(y, x)
+        r = norm2(x, y)
+        zr = z - self.l1
 
-        return np.array([q1, q2, q3])
+        D = (r**2 + zr**2 - self.l2**2 - self.l3**2) / (2 * self.l2 * self.l3)
+        D = clamp(D, -1.0, 1.0)
 
-    def jacobian(self, q=None):
-        q1, q2, q3 = q
+        # Elbow-down solution
+        q3 = np.arctan2(-np.sqrt(1 - D**2), D)
+        q2 = np.arctan2(zr, r) - np.arctan2(
+            self.l3 * np.sin(q3),
+            self.l2 + self.l3 * np.cos(q3)
+        )
 
-        s1 = np.sin(q1)
-        c1 = np.cos(q1)
+        # Clip to joint limits
+        q1 = clamp(q1, *self.q_limits[0])
+        q2 = clamp(q2, *self.q_limits[1])
+        q3 = clamp(q3, *self.q_limits[2])
 
-        s2  = np.sin(q2)
-        c2  = np.cos(q2)
+        return float(q1), float(q2), float(q3)
 
-        s23 = np.sin(q2 + q3)
+    # ── JACOBIAN ────────────────────────────────────────────────────────────
+    def jacobian(self, q1: float, q2: float, q3: float) -> np.ndarray:
+        """
+        Analytic 3×3 Jacobian J such that ẋ = J · q̇.
+        Rows: [dx/dq, dy/dq, dz/dq] for each joint.
+        """
+        c1, s1 = np.cos(q1), np.sin(q1)
         c23 = np.cos(q2 + q3)
+        s23 = np.sin(q2 + q3)
+        r = self.l2 * np.cos(q2) + self.l3 * np.cos(q2 + q3)
+        sh = self.l2 * np.sin(q2) + self.l3 * s23
 
         J = np.array([
-            [-s1*(self.l2*c2 + self.l3*c23),  c1*(-self.l2*s2 - self.l3*s23), -self.l3*s23*c1],
-            [ c1*(self.l2*c2 + self.l3*c23),  s1*(-self.l2*s2 - self.l3*s23), -self.l3*s23*s1],
-            [ 0,                               self.l2*c2 + self.l3*c23,        self.l3*c23   ]
+            [-r * s1,   -sh * c1,   -self.l3 * s23 * c1],
+            [ r * c1,   -sh * s1,   -self.l3 * s23 * s1],
+            [     0.0,   self.l2 * np.cos(q2) + self.l3 * c23,  self.l3 * c23],
         ])
         return J
 
-    def force_to_torque(self, f_tip, q=None):
-        J = self.jacobian(q)
-        if J is None:
-            return None
-        return J.T @ f_tip
+    def det_jacobian(self, q1: float, q2: float, q3: float) -> float:
+        """Determinant of Jacobian — near zero means singularity."""
+        return float(np.linalg.det(self.jacobian(q1, q2, q3)))
 
-    def check_singularity(self, q, threshold=1e-5):
-        J   = self.jacobian(q)
-        det = np.linalg.det(J)
-        return abs(det) < threshold, abs(det)
+    def is_singular(self, q1: float, q2: float, q3: float,
+                    threshold: float = 1e-3) -> bool:
+        return abs(self.det_jacobian(q1, q2, q3)) < threshold
 
-    def cartesian_trajectory(self, p_start, p_end, n_steps=50):
-        qs = []
-        for i in range(n_steps + 1):
-            t = i / n_steps
-            p_interp = (1 - t) * p_start + t * p_end
+    # ── FORCE → TORQUE ──────────────────────────────────────────────────────
+    def force_to_torque(self, q1: float, q2: float, q3: float,
+                        f: np.ndarray) -> np.ndarray:
+        """
+        τ = Jᵀ · f
+        f: [fx, fy, fz] end-effector force vector (N)
+        Returns: [τ1, τ2, τ3] joint torques (N·m)
+        """
+        J = self.jacobian(q1, q2, q3)
+        return J.T @ f
 
-            q = self.inverse_kinematics(p_interp)
-            if q is None:
-                print(f"[WARN] IK fallo en paso {i}, punto {p_interp}")
-                break
-
-            singular, det = self.check_singularity(q)
-            if singular:
-                print(f"[WARN] Singularidad detectada en paso {i}, det={det:.2e}")
-
-            qs.append(q)
-        return qs
-
-    def check_fk_ik_consistency(self, q_test=None):
-        if q_test is None:
-            q_test = np.array([0.3, 0.4, -0.6])
-
-        p_original  = self.forward_kinematics(q_test)
-        q_recovered = self.inverse_kinematics(p_original)
-        p_recovered = self.forward_kinematics(q_recovered)
-
-        error = np.linalg.norm(p_original - p_recovered)
-        print(f"Error FK->IK->FK: {error:.2e}")
-
-        return error < 1e-6
-
-    def differential_ik(self, q, v_cart):
-        J = self.jacobian(q)
-
-        J_pinv = np.linalg.pinv(J)
-
-        q_dot = J_pinv @ v_cart
-        return q_dot
+    # ── CARTESIAN TRAJECTORY ─────────────────────────────────────────────────
+    def cartesian_trajectory(self, p_start: np.ndarray, p_end: np.ndarray,
+                             n_steps: int = 50):
+        """
+        Linear interpolation in Cartesian space.
+        Returns list of (q1, q2, q3) waypoints.
+        Warns if singularity detected along path.
+        """
+        waypoints = []
+        for i, t in enumerate(np.linspace(0, 1, n_steps)):
+            p = p_start + t * (p_end - p_start)
+            q1, q2, q3 = self.inverse_kinematics(*p)
+            if self.is_singular(q1, q2, q3):
+                print(f"[ARM WARNING] Singularity near waypoint {i}/{n_steps}, |det J| < 1e-3")
+            waypoints.append((q1, q2, q3))
+        return waypoints
 
 
 class PuzzleBotArm:
-    JOINT_NAMES = ["q1 (base)", "q2 (hombro)", "q3 (codo)"]
+    """
+    Arm entity — wraps PuzzleBotArmModel with runtime joint state.
+    """
+    def __init__(self, model: PuzzleBotArmModel = None,
+                 q_home=(0.0, np.pi/6, -np.pi/4)):
+        self.model = model or PuzzleBotArmModel()
+        self.q = list(q_home)   # [q1, q2, q3] current joint angles
+        self.q_home = list(q_home)
+        self.q_target = list(q_home)
+        self.q_dot_max = 1.0    # max joint velocity rad/s
 
-    def __init__(
-        self,
-        model: PuzzleBotArmModel,
-        q_home=None,
-        joint_limits=None,
-        sim_delay: float = 0.0,
-    ):
-        self.model = model
-        self.sim_delay = sim_delay
+    def set_q_target(self, q_target):
+        self.q_target = list(q_target)
 
-        self.q_home = np.array(q_home, dtype=float) if q_home is not None \
-                      else np.zeros(3)
+    def set_ee_target(self, x: float, y: float, z: float):
+        q1, q2, q3 = self.model.inverse_kinematics(x, y, z)
+        self.q_target = [q1, q2, q3]
 
-        if joint_limits is not None:
-            self.joint_limits = [tuple(lim) for lim in joint_limits]
-        else:
-            self.joint_limits = [(-np.pi, np.pi)] * 3
+    def step(self, dt: float):
+        """Move joints toward target at max velocity."""
+        for i in range(3):
+            err = self.q_target[i] - self.q[i]
+            step = clamp(err, -self.q_dot_max * dt, self.q_dot_max * dt)
+            self.q[i] += step
 
-        self._q: np.ndarray = self.q_home.copy()   
-        self._p: np.ndarray | None = self.model.forward_kinematics(self._q)
+    def ee_position(self) -> np.ndarray:
+        return self.model.forward_kinematics(*self.q)
 
-        self._waypoints: dict[str, np.ndarray] = {}
+    def jacobian(self) -> np.ndarray:
+        return self.model.jacobian(*self.q)
 
-        self._history: list[dict] = []
+    def force_to_torque(self, f: np.ndarray) -> np.ndarray:
+        return self.model.force_to_torque(*self.q, f)
 
-        self._is_enabled: bool = False
-
-    @property
-    def q(self) -> np.ndarray:
-        return self._q.copy()
-
-    @property
-    def p(self) -> np.ndarray | None:
-        return self._p.copy() if self._p is not None else None
-
-    @property
-    def is_enabled(self) -> bool:
-        return self._is_enabled
-
-    @property
-    def history(self) -> list[dict]:
-        return list(self._history)
-
-    def enable(self):
-        self._is_enabled = True
-        print("[ARM] Brazo habilitado.")
-
-    def disable(self):
-        self._is_enabled = False
-        print("[ARM] Brazo deshabilitado.")
-
-    def _check_limits(self, q: np.ndarray) -> bool:
- 
-        for i, (qi, (q_min, q_max)) in enumerate(zip(q, self.joint_limits)):
-            if not (q_min <= qi <= q_max):
-                print(
-                    f"[ARM]  {self.JOINT_NAMES[i]} = {np.degrees(qi):.2f}° "
-                    f"fuera del rango [{np.degrees(q_min):.1f}°, {np.degrees(q_max):.1f}°]"
-                )
-                return False
-        return True
-
-    def _clamp_limits(self, q: np.ndarray) -> np.ndarray:
-        q_clamped = q.copy()
-        for i, (q_min, q_max) in enumerate(self.joint_limits):
-            q_clamped[i] = np.clip(q[i], q_min, q_max)
-        return q_clamped
-
-    def send_joint_command(self, q: np.ndarray):
-
-        deg = np.degrees(q)
-        print(
-            f"[HW]  → q = [{deg[0]:+7.2f}°, {deg[1]:+7.2f}°, {deg[2]:+7.2f}°]"
-        )
-        if self.sim_delay > 0:
-            time.sleep(self.sim_delay)
-
-    def move_to_joints(self, q_target, label: str = "") -> bool:
-        if not self._is_enabled:
-            print("[ARM] ERROR: El brazo no está habilitado.")
-            return False
-
-        q_target = np.array(q_target, dtype=float)
-
-        if not self._check_limits(q_target):
-            print("[ARM] Movimiento cancelado por límites articulares.")
-            return False
-
-        singular, det = self.model.check_singularity(q_target)
-        if singular:
-            print(f"[ARM] ⚠  Configuración singular (det={det:.2e}), movimiento cancelado.")
-            return False
-
-        self.send_joint_command(q_target)
-
-        self._q = q_target.copy()
-        self._p = self.model.forward_kinematics(self._q)
-
-        self._history.append({
-            "type":  "joint",
-            "label": label,
-            "q":     self._q.copy(),
-            "p":     self._p.copy() if self._p is not None else None,
-        })
-        return True
-
-    def move_to_cartesian(self, p_target, label: str = "") -> bool:
-
-        p_target = np.array(p_target, dtype=float)
-        q_target = self.model.inverse_kinematics(p_target)
-
-        if q_target is None:
-            print("[ARM] ERROR: IK no encontró solución para el punto objetivo.")
-            return False
-
-        return self.move_to_joints(q_target, label=label)
-
-    def move_cartesian_line(
-        self,
-        p_end,
-        n_steps: int = 30,
-        label: str = "",
-        clamp_limits: bool = False,
-    ) -> bool:
-
-        if not self._is_enabled:
-            print("[ARM] ERROR: El brazo no está habilitado.")
-            return False
-
-        if self._p is None:
-            print("[ARM] ERROR: Posición cartesiana actual desconocida.")
-            return False
-
-        p_start  = self._p.copy()
-        p_end    = np.array(p_end, dtype=float)
-        qs       = self.model.cartesian_trajectory(p_start, p_end, n_steps)
-
-        print(f"[ARM] Trayectoria lineal: {len(qs)} pasos.")
-
-        for i, q_step in enumerate(qs):
-            if clamp_limits:
-                q_step = self._clamp_limits(q_step)
-            elif not self._check_limits(q_step):
-                print(f"[ARM] Trayectoria abortada en paso {i} por límites articulares.")
-                return False
-
-            self.send_joint_command(q_step)
-
-        self._q = qs[-1].copy()
-        self._p = self.model.forward_kinematics(self._q)
-
-        self._history.append({
-            "type":    "cartesian_line",
-            "label":   label,
-            "p_start": p_start,
-            "p_end":   p_end,
-            "n_steps": len(qs),
-            "q":       self._q.copy(),
-            "p":       self._p.copy() if self._p is not None else None,
-        })
-        return True
-
-    def go_home(self) -> bool:
-        print("[ARM] Regresando a home…")
-        return self.move_to_joints(self.q_home, label="home")
-
-    def save_waypoint(self, name: str, q: np.ndarray | None = None):
-
-        q_save = np.array(q, dtype=float) if q is not None else self._q.copy()
-        self._waypoints[name] = q_save
-        print(f"[ARM] Waypoint '{name}' guardado: {np.degrees(q_save).round(2)} °")
-
-    def go_to_waypoint(self, name: str) -> bool:
-
-        if name not in self._waypoints:
-            print(f"[ARM] ERROR: Waypoint '{name}' no existe.")
-            return False
-        print(f"[ARM] Moviendo a waypoint '{name}'…")
-        return self.move_to_joints(self._waypoints[name], label=name)
-
-    def list_waypoints(self) -> list[str]:
-        return list(self._waypoints.keys())
-
-    def delete_waypoint(self, name: str) -> bool:
-        if name not in self._waypoints:
-            print(f"[ARM] ERROR: Waypoint '{name}' no existe.")
-            return False
-        del self._waypoints[name]
-        print(f"[ARM] Waypoint '{name}' eliminado.")
-        return True
-
-    def get_state(self) -> dict:
-        singular, det = self.model.check_singularity(self._q)
-        return {
-            "enabled":   self._is_enabled,
-            "q_deg":     np.degrees(self._q).round(4).tolist(),
-            "q_rad":     self._q.round(6).tolist(),
-            "p_m":       self._p.round(6).tolist() if self._p is not None else None,
-            "singular":  singular,
-            "det_J":     round(det, 6),
-            "waypoints": list(self._waypoints.keys()),
-        }
-
-    def print_state(self):
-        s = self.get_state()
-        print("=" * 50)
-        print("  Estado del PuzzleBotArm")
-        print("=" * 50)
-        print(f"  Habilitado : {s['enabled']}")
-        print(f"  q (grados) : {s['q_deg']}")
-        print(f"  q (rad)    : {s['q_rad']}")
-        print(f"  p (m)      : {s['p_m']}")
-        print(f"  Singular   : {s['singular']}  (det J = {s['det_J']:.4e})")
-        print(f"  Waypoints  : {s['waypoints']}")
-        print("=" * 50)
-
-    def clear_history(self):
-        self._history.clear()
-        print("[ARM] Historial limpiado.")
-
-    def __repr__(self) -> str:
-        q_deg = np.degrees(self._q).round(2)
-        return (
-            f"PuzzleBotArm("
-            f"enabled={self._is_enabled}, "
-            f"q={q_deg}°, "
-            f"waypoints={list(self._waypoints.keys())})"
-        )
-
-
+    def home(self):
+        self.q_target = list(self.q_home)

@@ -1,120 +1,97 @@
+"""
+classes/puzzlebot/puzzlebot.py
+PuzzleBot differential-drive base + full robot entity
+"""
+import numpy as np
+from utils import wrap_angle, clamp, norm2
 from classes.puzzlebot.puzzlebot_arm import PuzzleBotArm, PuzzleBotArmModel
-import numpy as np  
+
 
 class PuzzleBotModel:
-    def __init__(self, r = 0.05, L = 0.19, m = 2):
-        self.r = r
-        self.L = L
-        self.m = m
-        self.max_wheel_speed = 0.8
+    """
+    Differential-drive kinematics for PuzzleBot mobile base.
+    """
+    def __init__(self, r: float = 0.05, L: float = 0.19, maxspeed: float = 0.8):
+        self.r = r          # wheel radius (m)
+        self.L = L          # wheel separation (m)
+        self.maxspeed = maxspeed
 
-    def wrap_to_pi(self, angle):
-        return (angle + np.pi) % (2 * np.pi) - np.pi
-
-    def forward_kinematics(self, omega  = None):
-        if omega is None:
-            return None
-        
-        wr, wl = omega
-
-        v = (self.r / 2) * (wr + wl)
+    def forward_kinematics(self, wr: float, wl: float):
+        """Wheel speeds → (v, w)."""
+        v = (self.r / 2.0) * (wr + wl)
         w = (self.r / self.L) * (wr - wl)
+        return float(v), float(w)
 
-        return np.array([v, w])
-    
-    def inverse_kinematics(self, states):
-        if states is None:
-            return None
+    def inverse_kinematics(self, v: float, w: float):
+        """(v, w) → wheel speeds with saturation."""
+        wr = (2.0 * v + w * self.L) / (2.0 * self.r)
+        wl = (2.0 * v - w * self.L) / (2.0 * self.r)
+        mx = max(abs(wr), abs(wl))
+        if mx > self.maxspeed:
+            wr *= self.maxspeed / mx
+            wl *= self.maxspeed / mx
+        return float(wr), float(wl)
 
-        v, w = states
-
-        wr = (2*v + w*self.L)/(2*self.r)
-        wl = (2*v - w*self.L)/(2*self.r)
-
-        return np.array([wr,wl])
-    
-    def integrate(self, pose, omega, dt):
-        x, y, theta = pose
-
-        v, w = self.forward_kinematics(omega)
-
-        x += v * np.cos(theta) * dt
-        y += v * np.sin(theta) * dt
-        theta += w * dt
-        theta = self.wrap_to_pi(theta)
-
+    def integrate(self, pose: np.ndarray, v: float, w: float, dt: float):
+        """Euler integration. pose = [x, y, theta]."""
+        x = pose[0] + v * np.cos(pose[2]) * dt
+        y = pose[1] + v * np.sin(pose[2]) * dt
+        theta = wrap_angle(pose[2] + w * dt)
         return np.array([x, y, theta])
 
-    def jacobian(self, theta, p_ee_base):
-        x, y, _ = p_ee_base
-
-        J = np.array([
-            [np.cos(theta), -y],
-            [np.sin(theta),  x],
-            [0,              0]
-        ])
-
-        return J
-    
-    def clamp_wheels(self, omega):
-        return np.clip(omega, -self.max_wheel_speed, self.max_wheel_speed)
 
 class PuzzleBot:
-    def __init__(self, model: PuzzleBotModel, arm: PuzzleBotArm):
-        self.model = model
-        self.arm = arm
+    """
+    Full PuzzleBot entity: differential base + 3-DOF arm.
+    FSM states: IDLE → MOVING → GRASPING → STACKING → DONE
+    """
+    FSM_STATES = ['IDLE', 'MOVING', 'GRASPING', 'STACKING', 'DONE']
 
-        self.pose = np.array([0.0, 0.0, 0.0])
+    def __init__(self, robot_id: int, pose=(0.0, 0.0, 0.0),
+                 base_model: PuzzleBotModel = None,
+                 arm: PuzzleBotArm = None):
+        self.id = robot_id
+        self.model = base_model or PuzzleBotModel()
+        self.arm = arm or PuzzleBotArm()
+        self.pose = np.array(pose, dtype=float)
+        self.trail = []
+        self.state = 'IDLE'
+        self.target_box = None
 
-        self.omega = np.array([0.0, 0.0])
+    def set_twist(self, v: float, w: float, dt: float):
+        """Apply velocity command for one timestep."""
+        self.pose = self.model.integrate(self.pose, v, w, dt)
+        self.trail.append(self.pose[:2].copy())
+        if len(self.trail) > 500:
+            self.trail.pop(0)
 
-
-    def set_wheel_speeds(self, omega):
-        omega = np.array(omega)
-        self.omega = self.model.clamp_wheels(omega)
-
-    def set_twist(self, v, w):
-        omega = self.model.inverse_kinematics([v, w])
-        self.set_wheel_speeds(omega)
-
-    def step(self, dt):
+    def navigate_to(self, goal, dt: float, kv: float = 0.3, kw: float = 1.2):
         """
-        Avanza el estado del robot
+        Simple proportional controller toward a goal [x, y].
+        Returns True when within tolerance.
         """
-        self.pose = self.model.integrate(self.pose, self.omega, dt)
+        dx = goal[0] - self.pose[0]
+        dy = goal[1] - self.pose[1]
+        dist = norm2(dx, dy)
+        if dist < 0.05:
+            return True
+        ang_err = wrap_angle(np.arctan2(dy, dx) - self.pose[2])
+        v = clamp(kv * dist, 0.0, 0.5)
+        w = clamp(kw * ang_err, -1.5, 1.5)
+        self.set_twist(v, w, dt)
+        return False
 
-    def base_to_world(self, p_base):
-        x, y, theta = self.pose
+    def step(self, dt: float):
+        """Advance arm joints toward target."""
+        self.arm.step(dt)
 
-        R = np.array([
-            [np.cos(theta), -np.sin(theta), 0],
-            [np.sin(theta),  np.cos(theta), 0],
-            [0,              0,             1]
-        ])
+    @property
+    def x(self): return self.pose[0]
+    @property
+    def y(self): return self.pose[1]
+    @property
+    def theta(self): return self.pose[2]
 
-        t = np.array([x, y, 0])
-
-        return R @ p_base + t
-
-    def get_ee_world(self):
-        """
-        End-effector en coordenadas globales
-        """
-        p_arm = self.arm.p
-        return self.base_to_world(p_arm)
-
-    def get_state(self):
-        return {
-            "pose": self.pose.tolist(),
-            "omega": self.omega.tolist(),
-            "ee_world": self.get_ee_world().tolist()
-        }
-
-    def print_state(self):
-        s = self.get_state()
-        print("=" * 40)
-        print("PuzzleBot State")
-        print("=" * 40)
-        print(f"Pose     : {s['pose']}")
-        print(f"Omega    : {s['omega']}")
-        print(f"EE world : {s['ee_world']}")
+    def __repr__(self):
+        return (f"PuzzleBot(id={self.id}, state={self.state}, "
+                f"pos=({self.x:.3f},{self.y:.3f}), arm_q={[f'{q:.2f}' for q in self.arm.q]})")
