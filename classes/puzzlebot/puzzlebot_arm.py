@@ -3,6 +3,8 @@ classes/puzzlebot/puzzlebot_arm.py
 3-DOF PuzzleBot arm — FK, IK, Jacobian, force-torque mapping
 """
 import numpy as np
+import matplotlib
+import matplotlib.patches as patches
 from utils import clamp, norm2
 
 
@@ -156,3 +158,17 @@ class PuzzleBotArm:
 
     def home(self):
         self.q_target = list(self.q_home)
+        
+    def setup_visuals(self, ax):
+        """Setup Matplotlib artists for the arm."""
+        self.arm_line, = ax.plot([], [], '-', color='white', lw=1.5, zorder=6)
+        return [self.arm_line]
+
+    def update_visuals(self, bot_x, bot_y, bot_theta):
+        """Update arm visuals based on the base robot's pose."""
+        ee = self.ee_position()
+        # Scale the visual representation slightly for visibility
+        arm_ex = bot_x + ee[0] * np.cos(bot_theta) * 1.5
+        arm_ey = bot_y + ee[0] * np.sin(bot_theta) * 1.5
+        
+        self.arm_line.set_data([bot_x, arm_ex], [bot_y, arm_ey])

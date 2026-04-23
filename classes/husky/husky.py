@@ -3,6 +3,8 @@ classes/husky/husky.py
 Husky skid-steer robot — kinematics model + entity
 """
 import numpy as np
+import matplotlib
+import matplotlib.patches as patches
 from utils import wrap_angle, clamp, norm2
 
 
@@ -85,3 +87,42 @@ class Husky:
     def y(self): return self.pose[1]
     @property
     def theta(self): return self.pose[2]
+    
+    def setup_visuals(self, ax):
+        # Trail
+        self.trail_line, = ax.plot([], [], '-', color='#0ea5e9', lw=0.8, alpha=0.4, zorder=2)
+        
+        # Body
+        self.body_patch = patches.FancyBboxPatch(
+            (-0.28, -0.18), 0.56, 0.36, boxstyle='round,pad=0.02',
+            fc='#0ea5e9', ec='#7dd3fc', lw=1.5, zorder=5
+        )
+        ax.add_patch(self.body_patch)
+        
+        # Direction Arrow & Label
+        self.arrow = ax.annotate(
+            '', xy=(0.35, 0), xytext=(0, 0),
+            arrowprops=dict(arrowstyle='->', color='white', lw=1.5), zorder=6
+        )
+        self.label = ax.text(0, 0, 'HUSKY', color='#7dd3fc',
+                             fontsize=6, fontfamily='monospace', zorder=6)
+        
+        return [self.trail_line, self.body_patch, self.arrow, self.label]
+    
+    def update_visuals(self, ax):
+        # Update trail
+        if len(self.trail) > 1:
+            tr = np.array(self.trail)
+            self.trail_line.set_data(tr[:,0], tr[:,1])
+
+        # Apply transforms for body
+        t_mat = matplotlib.transforms.Affine2D().rotate(self.theta).translate(self.x, self.y)
+        self.body_patch.set_transform(t_mat + ax.transData)
+
+        # Update arrow and label
+        ax_end_x = self.x + 0.4 * np.cos(self.theta)
+        ax_end_y = self.y + 0.4 * np.sin(self.theta)
+        self.arrow.set_position((self.x, self.y))
+        self.arrow.xy = (ax_end_x, ax_end_y)
+        self.arrow.xytext = (self.x, self.y)
+        self.label.set_position((self.x + 0.35, self.y + 0.25))

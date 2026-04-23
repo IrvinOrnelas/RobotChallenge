@@ -4,6 +4,8 @@ PuzzleBot differential-drive base + full robot entity
 """
 import numpy as np
 from utils import wrap_angle, clamp, norm2
+import matplotlib
+import matplotlib.patches as patches
 from classes.puzzlebot.puzzlebot_arm import PuzzleBotArm, PuzzleBotArmModel
 
 
@@ -95,3 +97,35 @@ class PuzzleBot:
     def __repr__(self):
         return (f"PuzzleBot(id={self.id}, state={self.state}, "
                 f"pos=({self.x:.3f},{self.y:.3f}), arm_q={[f'{q:.2f}' for q in self.arm.q]})")
+        
+    def setup_visuals(self, ax):
+        """Setup Matplotlib artists for the PuzzleBot base and its arm."""
+        colors = ['#fbbf24', '#34d399', '#f472b6']
+        self.color = colors[self.id % 3] # Assign color based on ID
+
+        # Trail
+        self.trail_line, = ax.plot([], [], '-', color=self.color, lw=0.8, alpha=0.4, zorder=2)
+        
+        # Body
+        self.body_patch = patches.Circle((0, 0), 0.15, fc=self.color, ec='white', lw=1, zorder=5)
+        ax.add_patch(self.body_patch)
+        
+        # Label
+        self.label = ax.text(0, 0, f'PB{self.id}', color=self.color, 
+                             fontsize=6, fontfamily='monospace', zorder=6)
+
+        artists = [self.trail_line, self.body_patch, self.label]
+        artists.extend(self.arm.setup_visuals(ax))
+        return artists
+
+    def update_visuals(self, ax):
+        """Update visual state per frame."""
+        if len(self.trail) > 1:
+            tr = np.array(self.trail)
+            self.trail_line.set_data(tr[:,0], tr[:,1])
+
+        self.body_patch.center = (self.x, self.y)
+        self.label.set_position((self.x + 0.18, self.y + 0.18))
+
+        # Pass base pose to the arm so it can draw itself in the world frame
+        self.arm.update_visuals(self.x, self.y, self.theta)

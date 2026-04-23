@@ -25,7 +25,7 @@ from classes.husky.lidar import LiDAR
 from classes.anymal.anymal import Anymal
 from classes.puzzlebot.puzzlebot import PuzzleBot, PuzzleBotModel
 from classes.puzzlebot.puzzlebot_arm import PuzzleBotArm, PuzzleBotArmModel
-from coordinator import Coordinator, Box
+from coordinator import Coordinator, Box, Zone
 
 # ── WORLD CONSTANTS ──────────────────────────────────────────────────────────
 WORLD_W, WORLD_H = 14.0, 6.0
@@ -45,39 +45,6 @@ C_LIDAR    = '#06b6d422'
 C_TEXT     = '#e2e8f0'
 C_DIM      = '#475569'
 
-
-def build_robots():
-    """Instantiate all robots and return coordinator."""
-    husky = Husky(pose=(2.0, -1.8, 0.0))
-
-    anymal = Anymal(pose=(0.0, 0.0, 0.0), payload_kg=6.0)
-
-    arm_model = PuzzleBotArmModel(l1=0.10, l2=0.08, l3=0.06)
-    puzzlebots = [
-        PuzzleBot(i, pose=(9.5 + i * 0.5, 2.5, 0.0),
-                  arm=PuzzleBotArm(PuzzleBotArmModel()))
-        for i in range(3)
-    ]
-    
-    obstacle_boxes = [
-        Box('B1', 2.5,  0.5, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
-        Box('B2', 3.5, -0.4, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
-        Box('B3', 4.5,  0.3, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
-    ]
-    # Small boxes in work zone — PuzzleBots stack these
-    stack_boxes = [
-        Box('A', 10.0,  1.5, w=0.35, h=0.35, color='#ef4444'),
-        Box('B',  9.5,  3.0, w=0.35, h=0.35, color='#f59e0b'),
-        Box('C', 11.0,  2.0, w=0.35, h=0.35, color='#10b981'),
-    ]
-
-    coord = Coordinator(husky, anymal, puzzlebots,
-                        obstacle_boxes, stack_boxes,
-                        anymal_dest=(10.5, 0),
-                        stack_target=(12.0, 0.5))
-    return coord
-
-
 class Sim2D:
     """
     2D top-down simulation with matplotlib FuncAnimation.
@@ -89,7 +56,6 @@ class Sim2D:
         self.show_lidar = show_lidar
         self.show_trails = show_trails
         self.save = save
-        self.coord = build_robots()
         self.lidar = LiDAR(n_rays=72, max_range=5.0, noise_std=0.01)
         self.t = 0.0
         self.step_count = 0
@@ -106,6 +72,7 @@ class Sim2D:
         self.ax_i = self.axes[1]   # info panel
 
         self._setup_world()
+        self.coord = self.build_robots()
         self._setup_artists()
         self._setup_info_panel()
 
@@ -130,104 +97,77 @@ class Sim2D:
             ax.axvline(x, color=C_GRID, lw=0.4, zorder=0)
         for y in np.arange(-WORLD_H/2, WORLD_H/2 + 1, 1):
             ax.axhline(y, color=C_GRID, lw=0.4, zorder=0)
-
-        # Corridor zone (to be cleared)
-        corr = patches.Rectangle((0, -1), 6, 2,
-                                  fc=C_CORRIDOR, ec='#ef4444', lw=1,
-                                  ls='--', zorder=1)
-        ax.add_patch(corr)
-        ax.text(0.2, -0.9, 'CLEAR ZONE', color='#ef4444', fontsize=7,
-                fontfamily='monospace', zorder=2)
-
-        # Stack target zone
-        stack = patches.Rectangle((11.5, 0), 2, 2,
-                                   fc=C_STACK, ec='#10b981', lw=1,
-                                   ls='--', zorder=1)
-        ax.add_patch(stack)
-        ax.text(11.55, 2.1, 'STACK', color='#10b981', fontsize=7,
-                fontfamily='monospace', zorder=2)
+            
+        # Define our Zones
+        self.clear_zone = Zone('CLEAR ZONE', x_min=1.0, x_max=7.0, y_min=-1.0, y_max=1.0, color='#ef4444')
+        self.stack_zone = Zone('STACK ZONE', x_min=8.5, x_max=10.5, y_min=-1.0, y_max=1.0, color='#10b981')
 
         # ANYmal destination
-        ax.plot(11.0, 3.6, 'o', ms=8, mfc='none', mec='#a78bfa', mew=1.5, zorder=3)
-        ax.text(11.1, 3.65, 'p_dest', color='#a78bfa', fontsize=7,
+        ax.plot(7.5, 0, 'o', ms=8, mfc='none', mec='#a78bfa', mew=1.5, zorder=3)
+        ax.text(7.6, 0.05, 'p_dest', color='#a78bfa', fontsize=7,
                 fontfamily='monospace', zorder=3)
+    
+     # ── BUILD ROBOTS ────────────────────────────────────────────────────────
+    def build_robots(self):
+        """Instantiate all robots and return coordinator."""
+        husky = Husky(pose=(2.0, -1.8, 0.0))
+
+        anymal = Anymal(pose=(0.0, 0.0, 0.0), payload_kg=6.0)
+
+        arm_model = PuzzleBotArmModel(l1=0.10, l2=0.08, l3=0.06)
+        puzzlebots = [
+            PuzzleBot(i, pose=(9.5 + i * 0.5, 2.5, 0.0),
+                    arm=PuzzleBotArm(PuzzleBotArmModel()))
+            for i in range(3)
+        ]
+        
+        obstacle_boxes = [
+            Box('B1', 2.5,  0.5, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
+            Box('B2', 3.5, -0.4, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
+            Box('B3', 4.5,  0.3, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
+        ]
+        # Small boxes in work zone — PuzzleBots stack these
+        stack_boxes = [
+            Box('A', 10.0,  1.5, w=0.35, h=0.35, color='#ef4444'),
+            Box('B',  9.5,  3.0, w=0.35, h=0.35, color='#f59e0b'),
+            Box('C', 11.0,  2.0, w=0.35, h=0.35, color='#10b981'),
+        ]
+
+        coord = Coordinator(husky, anymal, puzzlebots,
+                            obstacle_boxes, stack_boxes,
+                            self.clear_zone, self.stack_zone,
+                            anymal_dest=(7.5, 0),
+                            stack_target=(9.0, 0.5),
+                            lidar=self.lidar)
+        return coord
 
     # ── ARTIST SETUP ────────────────────────────────────────────────────────
 
     def _setup_artists(self):
         ax = self.ax
         c = self.coord
+        self.visual_artists = []
+        
+        # 1. Setup Zones
+        self.visual_artists.extend(c.clear_zone.setup_visuals(ax))
+        self.visual_artists.extend(c.stack_zone.setup_visuals(ax))
 
-        # ── Trails ──────────────────────────────────────────────────────────
-        self.husky_trail,  = ax.plot([], [], '-', color=C_HUSKY,   lw=0.8, alpha=0.4, zorder=2)
-        self.anymal_trail, = ax.plot([], [], '-', color=C_ANYMAL,  lw=0.8, alpha=0.4, zorder=2)
-        self.pb_trails = [
-            ax.plot([], [], '-', color=C_PB[i], lw=0.8, alpha=0.4, zorder=2)[0]
-            for i in range(3)
-        ]
+        # Setup Boxes
+        for box in c.boxes:
+            self.visual_artists.extend(box.setup_visuals(ax))
 
-        # ── LiDAR rays ──────────────────────────────────────────────────────
+        # Setup Robots
+        self.visual_artists.extend(c.husky.setup_visuals(ax))
+        self.visual_artists.extend(c.anymal.setup_visuals(ax))
+        
+        for bot in c.puzzlebots:
+            self.visual_artists.extend(bot.setup_visuals(ax))
+
+        # ── LiDAR rays (Keep in sim.py since they are world-level) ──────────
         self.lidar_lines = [
             ax.plot([], [], '-', color=C_LIDAR, lw=0.3, zorder=2)[0]
             for _ in range(self.lidar.n_rays)
         ]
-
-        # ── Boxes ────────────────────────────────────────────────────────────
-        self.box_patches = {}
-        self.box_texts = {}
-        for box in c.boxes:
-            p = patches.Rectangle(
-                (box.x - box.w/2, box.y - box.h/2), box.w, box.h,
-                fc=C_BOX.get(box.id, '#94a3b8'), ec='white', lw=1.2, zorder=4
-            )
-            ax.add_patch(p)
-            t = ax.text(box.x, box.y, box.id, color='white',
-                        ha='center', va='center', fontsize=8,
-                        fontfamily='monospace', fontweight='bold', zorder=5)
-            self.box_patches[box.id] = p
-            self.box_texts[box.id] = t
-
-        # ── Husky (rectangle) ────────────────────────────────────────────────
-        self.husky_body = patches.FancyBboxPatch(
-            (-0.28, -0.18), 0.56, 0.36,
-            boxstyle='round,pad=0.02',
-            fc=C_HUSKY, ec='#7dd3fc', lw=1.5, zorder=5
-        )
-        ax.add_patch(self.husky_body)
-        self.husky_arrow = ax.annotate(
-            '', xy=(0.35, 0), xytext=(0, 0),
-            arrowprops=dict(arrowstyle='->', color='white', lw=1.5), zorder=6
-        )
-        self.husky_label = ax.text(0, 0, 'HUSKY', color='#7dd3fc',
-                                   fontsize=6, fontfamily='monospace', zorder=6)
-
-        # ── ANYmal (ellipse + legs) ────────────────────────────────────────
-        self.anymal_body = patches.Ellipse(
-            (0, 0), 0.7, 0.4,
-            fc=C_ANYMAL, ec='#c4b5fd', lw=1.5, zorder=5
-        )
-        ax.add_patch(self.anymal_body)
-        self.anymal_legs = [ax.plot([], [], '-o', color='#a78bfa', lw=1.5,
-                                    ms=3, zorder=5)[0] for _ in range(4)]
-        self.anymal_label = ax.text(0, 0, 'ANYmal', color='#c4b5fd',
-                                    fontsize=6, fontfamily='monospace', zorder=6)
-
-        # ── PuzzleBots ────────────────────────────────────────────────────
-        self.pb_bodies = [
-            patches.Circle((0, 0), 0.15, fc=C_PB[i], ec='white', lw=1, zorder=5)
-            for i in range(3)
-        ]
-        self.pb_arms = [
-            ax.plot([], [], '-', color='white', lw=1.5, zorder=6)[0]
-            for _ in range(3)
-        ]
-        self.pb_labels = [
-            ax.text(0, 0, f'PB{i}', color=C_PB[i], fontsize=6,
-                    fontfamily='monospace', zorder=6)
-            for i in range(3)
-        ]
-        for p in self.pb_bodies:
-            ax.add_patch(p)
 
         # ── Time / Phase text ──────────────────────────────────────────────
         self.time_text  = ax.text(0.01, 0.99, '', transform=ax.transAxes,
@@ -332,17 +272,15 @@ class Sim2D:
             if not c.task_completed():
                 c.step(DT)
 
-        # ── Update trails ───────────────────────────────────────────────────
-        if self.show_trails and len(c.husky.trail) > 1:
-            tr = np.array(c.husky.trail)
-            self.husky_trail.set_data(tr[:,0], tr[:,1])
-        if self.show_trails and len(c.anymal.trail) > 1:
-            tr = np.array(c.anymal.trail)
-            self.anymal_trail.set_data(tr[:,0], tr[:,1])
-        for i, bot in enumerate(c.puzzlebots):
-            if self.show_trails and len(bot.trail) > 1:
-                tr = np.array(bot.trail)
-                self.pb_trails[i].set_data(tr[:,0], tr[:,1])
+        # ── Update Entity Visuals ────────────────────────────────────────────
+        for box in c.boxes:
+            box.update_visuals()
+
+        c.husky.update_visuals(self.ax)
+        c.anymal.update_visuals(self.ax)
+
+        for bot in c.puzzlebots:
+            bot.update_visuals(self.ax)
 
         # ── LiDAR ────────────────────────────────────────────────────────────
         if self.show_lidar and c.phase.name == 'CLEARING':
@@ -355,52 +293,6 @@ class Sim2D:
         else:
             for line in self.lidar_lines:
                 line.set_data([], [])
-
-        # ── Boxes ───────────────────────────────────────────────────────────
-        for box in c.boxes:
-            p = self.box_patches[box.id]
-            p.set_xy((box.x - box.w/2, box.y - box.h/2))
-            if box.stacked:
-                p.set_alpha(0.6)
-            self.box_texts[box.id].set_position((box.x, box.y))
-
-        # ── Husky ───────────────────────────────────────────────────────────
-        h = c.husky
-        t_mat = matplotlib.transforms.Affine2D().rotate(h.theta).translate(h.x, h.y)
-        self.husky_body.set_transform(t_mat + self.ax.transData)
-        # arrow
-        ax_end_x = h.x + 0.4 * np.cos(h.theta)
-        ax_end_y = h.y + 0.4 * np.sin(h.theta)
-        self.husky_arrow.set_position((h.x, h.y))
-        self.husky_arrow.xy = (ax_end_x, ax_end_y)
-        self.husky_arrow.xytext = (h.x, h.y)
-        self.husky_label.set_position((h.x + 0.35, h.y + 0.25))
-
-        # ── ANYmal ──────────────────────────────────────────────────────────
-        a = c.anymal
-        t_mat_a = matplotlib.transforms.Affine2D().rotate(a.theta).translate(a.x, a.y)
-        self.anymal_body.set_transform(t_mat_a + self.ax.transData)
-        leg_names = list(a.legs.keys())
-        leg_offsets = [np.array([0.3, 0.2]), np.array([0.3,-0.2]),
-                       np.array([-0.3, 0.2]), np.array([-0.3,-0.2])]
-        for li, (leg_line, off) in enumerate(zip(self.anymal_legs, leg_offsets)):
-            phase_i = a.gait_phase + li * np.pi/2
-            hip_x = a.x + off[0]*np.cos(a.theta) - off[1]*np.sin(a.theta)
-            hip_y = a.y + off[0]*np.sin(a.theta) + off[1]*np.cos(a.theta)
-            foot_x = hip_x + 0.2 * np.sin(phase_i) * np.cos(a.theta)
-            foot_y = hip_y + 0.2 * np.sin(phase_i) * np.sin(a.theta)
-            leg_line.set_data([hip_x, foot_x], [hip_y, foot_y])
-        self.anymal_label.set_position((a.x + 0.42, a.y + 0.25))
-
-        # ── PuzzleBots ───────────────────────────────────────────────────────
-        for i, bot in enumerate(c.puzzlebots):
-            self.pb_bodies[i].center = (bot.x, bot.y)
-            ee = bot.arm.ee_position()
-            arm_ex = bot.x + ee[0] * np.cos(bot.theta) * 1.5
-            arm_ey = bot.y + ee[0] * np.sin(bot.theta) * 1.5
-            self.pb_arms[i].set_data([bot.x, arm_ex], [bot.y, arm_ey])
-            self.pb_labels[i].set_position((bot.x + 0.18, bot.y + 0.18))
-
         # ── HUD ────────────────────────────────────────────────────────────
         self.time_text.set_text(f't = {c.t:.1f}s')
         self.phase_text.set_text(f'Phase: {c.phase.name}')
@@ -408,14 +300,7 @@ class Sim2D:
         # ── Info panel ─────────────────────────────────────────────────────
         self._update_info()
 
-        return (self.husky_trail, self.anymal_trail,
-                self.husky_body, self.anymal_body,
-                self.time_text, self.phase_text,
-                *self.pb_bodies, *self.pb_arms,
-                *self.pb_trails, *self.lidar_lines,
-                *list(self.box_patches.values()),
-                *list(self.box_texts.values()),
-                *list(self.info_texts.values()))
+        return self.visual_artists + self.lidar_lines + [self.time_text, self.phase_text, *list(self.info_texts.values())]
 
     # ── RUN ─────────────────────────────────────────────────────────────────
 

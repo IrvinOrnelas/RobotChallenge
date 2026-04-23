@@ -19,6 +19,8 @@ Jacobian (exam-aligned):
         [0,          l1*sin(q2)+l2*sin(q2+q3),  l2*sin(q2+q3) ] ]
 """
 import numpy as np
+import matplotlib
+import matplotlib.patches as patches
 from utils import wrap_angle, clamp, norm2
 
 
@@ -233,6 +235,25 @@ class AnymalLeg:
 
         self.set_foot_target(target_x, target_y, target_z)
         self.check_singularity()
+        
+    def setup_visuals(self, ax):
+        """Setup Matplotlib artists for a single leg."""
+        self.leg_line, = ax.plot([], [], '-o', color='#a78bfa', lw=1.5, ms=3, zorder=5)
+        return [self.leg_line]
+
+    def update_visuals(self, body_pose):
+        """Update leg line from the hip to the foot's world position."""
+        bx, by, bth = body_pose
+        so = self.shoulder
+        
+        # Calculate world position of the hip/shoulder joint
+        hip_x = bx + so[0]*np.cos(bth) - so[1]*np.sin(bth)
+        hip_y = by + so[0]*np.sin(bth) + so[1]*np.cos(bth)
+
+        # Calculate world position of the foot using your kinematic method
+        foot_w = self.fk_world(body_pose)
+
+        self.leg_line.set_data([hip_x, foot_w[0]], [hip_y, foot_w[1]])
 
 
 class Anymal:
@@ -322,3 +343,37 @@ class Anymal:
     def min_det_J(self) -> float:
         """Minimum |det J| across all legs (safety metric)."""
         return min(abs(leg.det_J()) for leg in self.legs.values())
+    
+    def setup_visuals(self, ax):
+        """Setup Matplotlib artists for the ANYmal body and legs."""
+        # Trail
+        self.trail_line, = ax.plot([], [], '-', color='#7c3aed', lw=0.8, alpha=0.4, zorder=2)
+        
+        # Body
+        self.body_patch = patches.Ellipse((0, 0), 0.7, 0.4, fc='#7c3aed', ec='#c4b5fd', lw=1.5, zorder=5)
+        ax.add_patch(self.body_patch)
+        
+        # Label
+        self.label = ax.text(0, 0, 'ANYmal', color='#c4b5fd', 
+                             fontsize=6, fontfamily='monospace', zorder=6)
+
+        artists = [self.trail_line, self.body_patch, self.label]
+        for leg in self.legs.values():
+            artists.extend(leg.setup_visuals(ax))
+        return artists
+
+    def update_visuals(self, ax):
+        """Update visual state per frame."""
+        if len(self.trail) > 1:
+            tr = np.array(self.trail)
+            self.trail_line.set_data(tr[:,0], tr[:,1])
+
+        # Apply body rotation and translation
+        t_mat = matplotlib.transforms.Affine2D().rotate(self.theta).translate(self.x, self.y)
+        self.body_patch.set_transform(t_mat + ax.transData)
+
+        self.label.set_position((self.x + 0.42, self.y + 0.25))
+
+        # Update all legs
+        for leg in self.legs.values():
+            leg.update_visuals(self.pose)
