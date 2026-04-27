@@ -13,7 +13,7 @@ class HuskyModel:
     Pure kinematics model for the Husky 4-wheel skid-steer robot.
     Mirrors the JS HuskyModel exactly.
     """
-    def __init__(self, r: float = 0.1651, B: float = 0.555, maxspeed: float = 1.0):
+    def __init__(self, r: float = 0.1651, B: float = 0.555, maxspeed: float = 2.0):
         self.r = r            # wheel radius (m)
         self.B = B            # track width (m)
         self.maxspeed = maxspeed
@@ -61,7 +61,7 @@ class Husky:
     """
     Husky robot entity — holds state and wraps HuskyModel.
     """
-    def __init__(self, pose=(0.5, -1.8, 0.0), r=0.1651, B=0.555, maxspeed=1.0):
+    def __init__(self, pose=(0.5, -1.8, 0.0), r=0.1651, B=0.555, maxspeed=1.0, w=0.56, h=0.36):
         self.model = HuskyModel(r=r, B=B, maxspeed=maxspeed)
         self.pose = np.array(pose, dtype=float)   # [x, y, theta]
         self.v_cmd = 0.0
@@ -69,6 +69,8 @@ class Husky:
         self.v_meas = 0.0
         self.w_meas = 0.0
         self.trail = []
+        self.w = w
+        self.h = h
 
     def step(self, dt: float, wr: float, wl: float):
         self.pose, self.v_meas, self.w_meas = self.model.integrate(self.pose, wr, wl, dt)
@@ -93,8 +95,8 @@ class Husky:
         self.trail_line, = ax.plot([], [], '-', color='#0ea5e9', lw=0.8, alpha=0.4, zorder=2)
         
         # Body
-        self.body_patch = patches.FancyBboxPatch(
-            (-0.28, -0.18), 0.56, 0.36, boxstyle='round,pad=0.02',
+        self.body_patch = patches.Rectangle(
+            (-self.w/2, -self.h/2), self.w, self.h,
             fc='#0ea5e9', ec='#7dd3fc', lw=1.5, zorder=5
         )
         ax.add_patch(self.body_patch)
@@ -126,3 +128,8 @@ class Husky:
         self.arrow.xy = (ax_end_x, ax_end_y)
         self.arrow.xytext = (self.x, self.y)
         self.label.set_position((self.x + 0.35, self.y + 0.25))
+        
+    def get_bounds(self):
+            """Based on the Matplotlib patch dimensions (width=0.56, height=0.36)"""
+            return (self.x - self.w/2, self.x + self.w/2, 
+                    self.y - self.h/2, self.y + self.h/2)

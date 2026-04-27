@@ -110,7 +110,7 @@ class Sim2D:
      # ── BUILD ROBOTS ────────────────────────────────────────────────────────
     def build_robots(self):
         """Instantiate all robots and return coordinator."""
-        husky = Husky(pose=(2.0, -1.8, 0.0))
+        husky = Husky(pose=(1.5, -1.8, 0.0))
 
         anymal = Anymal(pose=(0.0, 0.0, 0.0), payload_kg=6.0)
 
@@ -122,9 +122,9 @@ class Sim2D:
         ]
         
         obstacle_boxes = [
-            Box('B1', 2.5,  0.5, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
-            Box('B2', 3.5, -0.4, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
-            Box('B3', 4.5,  0.3, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
+            Box('B1', 2.5,  0.0, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
+            Box('B2', 4.0,  0.0, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
+            Box('B3', 5.5,  0.0, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
         ]
         # Small boxes in work zone — PuzzleBots stack these
         stack_boxes = [

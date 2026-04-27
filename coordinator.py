@@ -34,6 +34,7 @@ PHASE 4 — STACKING (PuzzleBots, ONE AT A TIME — time-slotting)
 from enum import Enum, auto
 import numpy as np
 from sklearn.cluster import KMeans
+from utils import check_aabb_collision
 from utils import norm2, wrap_angle, clamp
 from classes.elements.box import Box
 from classes.elements.zone import Zone
@@ -189,6 +190,12 @@ class Coordinator:
             
         # 1. SCAN: Look for obstacles inside the Clear Zone
         if self.husky_fsm == HuskyFSM.SCAN:
+            # Count exactly how many boxes still overlap with the clear zone area
+            boxes_left = 0
+            for b in self.obstacle_boxes:
+                if check_aabb_collision(b.get_bounds(), self.clear_zone.get_bounds()):
+                    boxes_left += 1
+                    
             obstacles = [{'x': b.x, 'y': b.y, 'w': b.w, 'h': b.h} for b in self.boxes]
             ranges, angles = self.lidar.scan(self.husky.pose, obstacles)
             points = self.lidar.get_points(self.husky.pose, ranges, angles)
@@ -196,27 +203,32 @@ class Coordinator:
             # Ask the Zone what is inside it
             points_in_zone = self.clear_zone.get_points_inside(points)
             
-            if len(points_in_zone) < 5:  # Noise threshold
+            if boxes_left == 0:
                 self._log("✅ CLEARING done — corridor clear")
                 self._log("═══ PHASE 2: TRANSPORTING — ANYmal walks to work zone ═══")
                 self.phase = Phase.TRANSPORTING
                 return
             else:
-                # Find the centroid of the nearest obstacle to push
-                boxes_left = sum(1 for b in self.obstacle_boxes if self.clear_zone.contains(b.x, b.y))
-                k = max(1, boxes_left) # Prevent k=0 if there's lingering noise
+                # Get LiDAR points for ML Clustering
+                obstacles = [{'x': b.x, 'y': b.y, 'w': b.w, 'h': b.h} for b in self.boxes]
+                ranges, angles = self.lidar.scan(self.husky.pose, obstacles)
+                points = self.lidar.get_points(self.husky.pose, ranges, angles)
+                points_in_zone = self.clear_zone.get_points_inside(points)
                 
-                kmeans = KMeans(n_clusters=k, n_init='auto', random_state=42)
-                labels = kmeans.fit_predict(points_in_zone)
-                centroids = kmeans.cluster_centers_
-                
-                # Pick the centroid that is closest to the Husky
-                hx, hy = self.husky.x, self.husky.y
-                closest_centroid = min(centroids, key=lambda c: norm2(c[0] - hx, c[1] - hy))
-                
-                self.husky_target_pt = closest_centroid
-                self.husky_fsm = HuskyFSM.APPROACH
-                self._log(f"  Target cluster locked at ({self.husky_target_pt[0]:.2f}, {self.husky_target_pt[1]:.2f})")
+                # ML Clustering to target the remaining boxes
+                if len(points_in_zone) >= 5:
+                    k = max(1, boxes_left) # Prevent k=0 if there's lingering noise
+                    kmeans = KMeans(n_clusters=k, n_init='auto', random_state=42)
+                    labels = kmeans.fit_predict(points_in_zone)
+                    centroids = kmeans.cluster_centers_
+                    
+                    # Pick the centroid that is closest to the Husky
+                    hx, hy = self.husky.x, self.husky.y
+                    closest_centroid = min(centroids, key=lambda c: norm2(c[0] - hx, c[1] - hy))
+                    
+                    self.husky_target_pt = closest_centroid
+                    self.husky_fsm = HuskyFSM.APPROACH
+                    self._log(f"  Target cluster locked at ({self.husky_target_pt[0]:.2f}, {self.husky_target_pt[1]:.2f})")
             
         if self.husky_box_idx >= len(self.obstacle_boxes):
             self._log("✅ CLEARING done — corridor clear")
@@ -270,16 +282,23 @@ class Coordinator:
             # Update telemetry HUD
             self.husky.v_cmd, self.husky.w_cmd = v, w 
             
+            husky_bounds = self.husky.get_bounds()
+            target_box_cleared = True
+            
             # Improved physics: wider catch area so it doesn't clip through boxes!
             for box in self.boxes:
-                if box.obstacle_box and abs(box.x - self.husky.x) < 0.3:
-                    if 0 < (box.y - self.husky.y) < 0.8:
-                        box.y += v * dt  # Shove the box forward
+                if box.obstacle_box:
+                    box_bounds = box.get_bounds()
+                    
+                    # 1. If Husky's bounds hit Box's bounds, push it along Husky's heading!
+                    if check_aabb_collision(husky_bounds, box_bounds):
+                        box.x += v * dt * np.cos(self.husky.theta)
+                        box.y += v * dt * np.sin(self.husky.theta)
                         
-            target_box_cleared = True
-            for box in self.boxes:
-                if box.obstacle_box and self.clear_zone.contains(box.x, box.y):
-                    target_box_cleared = False
+                    # 2. Re-calculate bounds after movement to see if it left the zone
+                    new_box_bounds = box.get_bounds()
+                    if check_aabb_collision(new_box_bounds, self.clear_zone.get_bounds()):
+                        target_box_cleared = False
 
             # Stop pushing if Husky leaves the zone OR as a safety timeout
             if target_box_cleared or self.push_timer > 12.0:
@@ -317,13 +336,18 @@ class Coordinator:
             if d < 1e-3:
                 self.det_J_violations += 1
 
+        # Calculate APF steering
         safe_dest = self._get_avoidance_target(self.anymal.pose, self.anymal_dest, self.obstacle_boxes, safe_dist=1.0)
-        arrived = self.anymal.navigate_to(safe_dest, dt)
+        self.anymal.navigate_to(safe_dest, dt)
+        
+        true_dist = norm2(self.anymal_dest[0] - self.anymal.x, 
+                          self.anymal_dest[1] - self.anymal.y)
 
-        if arrived:
-            err = norm2(self.anymal_dest[0] - self.anymal.x,
-                        self.anymal_dest[1] - self.anymal.y)
-            self._log(f"✅ ANYmal at pdest, err={err:.4f} m | "
+        if true_dist < 0.15:
+            # Force ANYmal to stop walking
+            self.anymal.step(dt, 0.0, 0.0)
+            
+            self._log(f"✅ ANYmal at pdest, err={true_dist:.4f} m | "
                       f"det_J violations={self.det_J_violations}")
             self._log("═══ PHASE 3: DEPLOYING — placing PuzzleBots at work surface ═══")
             self.phase     = Phase.DEPLOYING
@@ -478,7 +502,9 @@ class Coordinator:
         dx, dy = tx - rx, ty - ry
         dist_t = norm2(dx, dy)
         if dist_t > 0:
-            dx, dy = dx / dist_t, dy / dist_t # Normalize
+            scale = min(1.0, dist_t)
+            dx = (dx / dist_t) * scale
+            dy = (dy / dist_t) * scale
             
         # 2. Repulsive vectors away from obstacles
         rep_x, rep_y = 0.0, 0.0
@@ -487,15 +513,12 @@ class Coordinator:
             dist_o = norm2(rx - ox, ry - oy)
             
             if 0.01 < dist_o < safe_dist:
-                # Calculate repulsive force magnitude
                 mag = k_rep * (1.0 / dist_o - 1.0 / safe_dist) / (dist_o**2)
-                # Apply force vector pointing away from obstacle
                 rep_x += mag * (rx - ox) / dist_o
                 rep_y += mag * (ry - oy) / dist_o
                 
         # 3. Combine vectors to create a new virtual waypoint
-        virtual_target = [rx + dx + rep_x, ry + dy + rep_y]
-        return virtual_target
+        return [rx + dx + rep_x, ry + dy + rep_y]
 
     # ── STATUS ────────────────────────────────────────────────────────────────
 

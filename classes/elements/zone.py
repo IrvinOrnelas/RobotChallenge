@@ -40,6 +40,6 @@ class Zone:
         """Static zones don't move, but this maintains the visual update pattern."""
         pass
     
-    def contains(self, x, y):
-        """Returns True if the point (x,y) is strictly inside the zone boundaries."""
-        return (self.x_min <= x <= self.x_max) and (self.y_min <= y <= self.y_max)
+    def get_bounds(self):
+        """Zones are already defined by their min/max boundaries."""
+        return (self.x_min, self.x_max, self.y_min, self.y_max)

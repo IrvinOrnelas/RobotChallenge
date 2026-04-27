@@ -129,3 +129,9 @@ class PuzzleBot:
 
         # Pass base pose to the arm so it can draw itself in the world frame
         self.arm.update_visuals(self.x, self.y, self.theta)
+        
+    def get_bounds(self):
+        """Based on the Matplotlib circle patch (radius=0.15)"""
+        r = 0.15
+        return (self.x - r, self.x + r, 
+                self.y - r, self.y + r)

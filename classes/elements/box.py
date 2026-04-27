@@ -35,3 +35,8 @@ class Box:
         if self.stacked:
             self.patch.set_alpha(0.6)
         self.text_artist.set_position((self.x, self.y))
+        
+    def get_bounds(self):
+        """Returns (x_min, x_max, y_min, y_max) based on width and height."""
+        return (self.x - self.w/2, self.x + self.w/2, 
+                self.y - self.h/2, self.y + self.h/2)
