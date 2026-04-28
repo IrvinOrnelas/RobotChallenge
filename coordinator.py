@@ -38,6 +38,7 @@ from utils import check_aabb_collision
 from utils import norm2, wrap_angle, clamp
 from classes.elements.box import Box
 from classes.elements.zone import Zone
+from utils import get_aabb_distance, detect_collision_groups, propagate_push_force, check_aabb_collision
 
 # ── ENUMS ────────────────────────────────────────────────────────────────────
 
@@ -99,6 +100,7 @@ class Coordinator:
     def __init__(self, husky, anymal, puzzlebots: list,
                  obstacle_boxes: list, stack_boxes: list,
                  clear_zone: list, stack_zone: list,
+                 xarms: list = None,
                  anymal_dest=(11.0, 3.6),
                  stack_target=(12.0, 3.0),
                  lidar: object = None):
@@ -146,6 +148,11 @@ class Coordinator:
 
         self.t   = 0.0
         self.log = []
+        
+        # ── xArm state ────────────────────────────────────────────────────────
+        self.xarms = xarms or []
+        self.unassigned_pbs = [0, 1, 2]
+        self.xarm_fsm = [{'state': 'IDLE', 'pb': None, 'timer': 0.0} for _ in self.xarms]
 
     # ── LOGGING ──────────────────────────────────────────────────────────────
 
@@ -179,6 +186,9 @@ class Coordinator:
 
     # ── PHASE: CLEARING ──────────────────────────────────────────────────────
 
+     # ── PHASE: CLEARING ──────────────────────────────────────────────────────
+
+
     def _do_clearing(self, dt):
         """
         Husky clears corridor of B1, B2, B3 one by one.
@@ -187,7 +197,6 @@ class Coordinator:
         # Keep bots riding on stationary ANYmal
         for i in range(3):
             self._snap_bot_to_anymal(i)
-            
         # 1. SCAN: Look for obstacles inside the Clear Zone
         if self.husky_fsm == HuskyFSM.SCAN:
             # Count exactly how many boxes still overlap with the clear zone area
@@ -199,22 +208,16 @@ class Coordinator:
             obstacles = [{'x': b.x, 'y': b.y, 'w': b.w, 'h': b.h} for b in self.boxes]
             ranges, angles = self.lidar.scan(self.husky.pose, obstacles)
             points = self.lidar.get_points(self.husky.pose, ranges, angles)
-            
+                    
             # Ask the Zone what is inside it
             points_in_zone = self.clear_zone.get_points_inside(points)
-            
             if boxes_left == 0:
                 self._log("✅ CLEARING done — corridor clear")
                 self._log("═══ PHASE 2: TRANSPORTING — ANYmal walks to work zone ═══")
                 self.phase = Phase.TRANSPORTING
                 return
+
             else:
-                # Get LiDAR points for ML Clustering
-                obstacles = [{'x': b.x, 'y': b.y, 'w': b.w, 'h': b.h} for b in self.boxes]
-                ranges, angles = self.lidar.scan(self.husky.pose, obstacles)
-                points = self.lidar.get_points(self.husky.pose, ranges, angles)
-                points_in_zone = self.clear_zone.get_points_inside(points)
-                
                 # ML Clustering to target the remaining boxes
                 if len(points_in_zone) >= 5:
                     k = max(1, boxes_left) # Prevent k=0 if there's lingering noise
@@ -227,83 +230,80 @@ class Coordinator:
                     closest_centroid = min(centroids, key=lambda c: norm2(c[0] - hx, c[1] - hy))
                     
                     self.husky_target_pt = closest_centroid
+                    
                     self.husky_fsm = HuskyFSM.APPROACH
-                    self._log(f"  Target cluster locked at ({self.husky_target_pt[0]:.2f}, {self.husky_target_pt[1]:.2f})")
-            
-        if self.husky_box_idx >= len(self.obstacle_boxes):
-            self._log("✅ CLEARING done — corridor clear")
-            self._log("═══ PHASE 2: TRANSPORTING — ANYmal walks to work zone ═══")
-            self.phase = Phase.TRANSPORTING
-            return
-        
+                    self._log(f" Target cluster locked at ({self.husky_target_pt[0]:.2f}, {self.husky_target_pt[1]:.2f})")
+                    
+            if self.husky_box_idx >= len(self.obstacle_boxes):
+                self._log("✅ CLEARING done — corridor clear")
+                self._log("═══ PHASE 2: TRANSPORTING — ANYmal walks to work zone ═══")
+                self.phase = Phase.TRANSPORTING
+                return
+
         # 2. APPROACH: Drive behind the detected target
         elif self.husky_fsm == HuskyFSM.APPROACH:
             target_x, target_y = self.husky_target_pt
             staging_pt = [target_x, target_y - 0.75] # Go comfortably behind the box
             
             other_boxes = [b for b in self.obstacle_boxes if b.x != target_x]
-            safe_target = self._get_avoidance_target(self.husky.pose, staging_pt, other_boxes, safe_dist=0.6)
+            safe_target = self._get_avoidance_target(self.husky, staging_pt, other_boxes, safe_dist=0.3)
             
             dist = norm2(staging_pt[0] - self.husky.x, staging_pt[1] - self.husky.y)
             v, w = self.husky.model.compute_velocity_command(self.husky.pose, safe_target)
             wr, wl = self.husky.model.inverse_kinematics(v, w)
             self.husky.step(dt, wr, wl)
-            
+
             # Update telemetry HUD
-            self.husky.v_cmd, self.husky.w_cmd = v, w 
-            
+            self.husky.v_cmd, self.husky.w_cmd = v, w
+
             if dist < 0.2:
                 self.husky_fsm = HuskyFSM.ALIGN
+
 
         # 3. ALIGN: Face the target
         elif self.husky_fsm == HuskyFSM.ALIGN:
             target_x, target_y = self.husky_target_pt
             angle_to_target = np.arctan2(target_y - self.husky.y, target_x - self.husky.x)
             ang_err = wrap_angle(angle_to_target - self.husky.pose[2])
-            
             w = clamp(2.0 * ang_err, -1.5, 1.5)
             wr, wl = self.husky.model.inverse_kinematics(0.0, w)
             self.husky.step(dt, wr, wl)
-            
+
             # Update telemetry HUD
-            self.husky.v_cmd, self.husky.w_cmd = 0.0, w 
-            
+            self.husky.v_cmd, self.husky.w_cmd = 0.0, w
+
             if abs(ang_err) < 0.08:
                 self.husky_fsm = HuskyFSM.PUSH
-                self.push_timer = 0.0
-                
+
+            self.push_timer = 0.0
+
         # 4. PUSH: Ram straight forward to shove the box
         elif self.husky_fsm == HuskyFSM.PUSH:
             self.push_timer += dt
             v, w = 0.5, 0.0 # Push forward steadily
             wr, wl = self.husky.model.inverse_kinematics(v, w)
             self.husky.step(dt, wr, wl)
-            
+
             # Update telemetry HUD
-            self.husky.v_cmd, self.husky.w_cmd = v, w 
-            
+            self.husky.v_cmd, self.husky.w_cmd = v, w
+
             husky_bounds = self.husky.get_bounds()
             target_box_cleared = True
             
-            # Improved physics: wider catch area so it doesn't clip through boxes!
-            for box in self.boxes:
-                if box.obstacle_box:
-                    box_bounds = box.get_bounds()
-                    
-                    # 1. If Husky's bounds hit Box's bounds, push it along Husky's heading!
-                    if check_aabb_collision(husky_bounds, box_bounds):
-                        box.x += v * dt * np.cos(self.husky.theta)
-                        box.y += v * dt * np.sin(self.husky.theta)
-                        
-                    # 2. Re-calculate bounds after movement to see if it left the zone
-                    new_box_bounds = box.get_bounds()
-                    if check_aabb_collision(new_box_bounds, self.clear_zone.get_bounds()):
-                        target_box_cleared = False
+            mover_vel = (v * np.cos(self.husky.theta), v * np.sin(self.husky.theta))
+            obstacle_list = [b for b in self.boxes if b.obstacle_box]
+            propagate_push_force(husky_bounds, mover_vel, obstacle_list, dt)
+
+            # 2. Re-calculate bounds after movement to see if it left the zone
+            for box in obstacle_list:
+                if check_aabb_collision(box.get_bounds(), self.clear_zone.get_bounds()):
+                    target_box_cleared = False
 
             # Stop pushing if Husky leaves the zone OR as a safety timeout
-            if target_box_cleared or self.push_timer > 12.0:
+            if target_box_cleared or self.push_timer > 15.0:
                 self.husky_fsm = HuskyFSM.RETREAT
                 self.retreat_timer = 0.0
+
 
         # 5. RETREAT: Back up briefly to un-stick, then scan again
         elif self.husky_fsm == HuskyFSM.RETREAT:
@@ -311,13 +311,11 @@ class Coordinator:
             v, w = -0.5, 0.0 # Reverse
             wr, wl = self.husky.model.inverse_kinematics(v, w)
             self.husky.step(dt, wr, wl)
-            
             # Update telemetry HUD
-            self.husky.v_cmd, self.husky.w_cmd = v, w 
-            
-            # Only back up for 1.2 seconds, then immediately scan again
-            if self.retreat_timer > 1.2: 
-                self.husky_fsm = HuskyFSM.SCAN
+            self.husky.v_cmd, self.husky.w_cmd = v, w
+            # Only back up for 5.0 seconds, then immediately scan again
+            if self.retreat_timer > 5.0:
+                self.husky_fsm = HuskyFSM.SCAN 
 
     # ── PHASE: TRANSPORTING ───────────────────────────────────────────────────
 
@@ -337,7 +335,7 @@ class Coordinator:
                 self.det_J_violations += 1
 
         # Calculate APF steering
-        safe_dest = self._get_avoidance_target(self.anymal.pose, self.anymal_dest, self.obstacle_boxes, safe_dist=1.0)
+        safe_dest = self._get_avoidance_target(self.anymal, self.anymal_dest, self.obstacle_boxes, safe_dist=1.0)
         self.anymal.navigate_to(safe_dest, dt)
         
         true_dist = norm2(self.anymal_dest[0] - self.anymal.x, 
@@ -360,26 +358,77 @@ class Coordinator:
         ANYmal is still. PuzzleBots are placed one by one at deploy positions.
         (In real life the xArm does this; here we snap them instantly.)
         """
-        if self.deploy_idx >= 3:
-            self._log("✅ All 3 PuzzleBots deployed on work surface")
+        
+        all_idle = True
+        
+        for pb_idx in self.unassigned_pbs:
+            self._snap_bot_to_anymal(pb_idx)
+            
+        for i, arm in enumerate(self.xarms):
+            fsm = self.xarm_fsm[i]
+            
+            if fsm['state'] in ['REACHING', 'GRABBING'] and fsm['pb'] is not None:
+                self._snap_bot_to_anymal(fsm['pb'])
+                
+            if fsm['state'] == 'IDLE':
+                if len(self.unassigned_pbs) > 0:
+                    pb_idx = self.unassigned_pbs.pop(0)
+                    fsm['pb'] = pb_idx
+                    pb = self.puzzlebots[pb_idx]
+                    arm.set_target(pb.x, pb.y, tz=-0.05)
+                    fsm['state'] = 'REACHING'
+                    all_idle = False
+            
+            elif fsm['state'] == 'REACHING':
+                all_idle = False
+                if arm.step(dt):
+                    fsm['state'] = 'GRABBING'
+                    fsm['timer'] = 0.
+                    
+            elif fsm['state'] == 'GRABBING':
+                all_idle = False
+                fsm['timer'] += dt
+                if fsm['timer'] > 0.5:
+                    pb_idx = fsm['pb']
+                    deploy_pos = self.anymal_dest + self.DEPLOY_OFFSETS[pb_idx]
+                    arm.set_target(deploy_pos[0], deploy_pos[1])
+                    fsm['state'] = 'MOVING'
+                    
+            elif fsm['state'] == 'MOVING':
+                all_idle = False
+                arrived = arm.step(dt)
+                pb_idx = fsm['pb']
+                
+                self.puzzlebots[pb_idx].pose[0] = arm.ee_x
+                self.puzzlebots[pb_idx].pose[1] = arm.ee_y
+                
+                if arrived:
+                    fsm['state'] = 'RELEASING'
+                    fsm['timer'] = 0.0
+                    
+            elif fsm['state'] == 'RELEASING':
+                all_idle = False
+                fsm['timer'] += dt
+                if fsm['timer'] > 0.3:
+                    pb_idx = fsm['pb']
+                    pb = self.puzzlebots[pb_idx]
+                    self.pb_fsm[pb_idx] = PuzzleBotFSM.DEPLOYED
+                    arm.set_target(pb.x, pb.y, tz=-0.05)
+                    fsm['state'] = 'RETURNING'
+                    fsm['pb'] = None
+                    self._log(f"  xArm {i} desplegó el PuzzleBot {pb_idx}")
+                    
+            elif fsm['state'] == 'RETURNING':
+                if not arm.step(dt):
+                    all_idle = False
+                else:
+                    fsm['state'] = 'IDLE'
+                    
+        if all_idle and len(self.unassigned_pbs) == 0:
+            self._log("✅ Los xArms terminaron de descargar los 3 PuzzleBots")
             self._log("═══ PHASE 4: STACKING — C → B → A (time-slotting) ═══")
             self.active_stacker = 0
             self.phase = Phase.STACKING
-            return
-
-        i      = self.deploy_idx
-        bot    = self.puzzlebots[i]
-        offset = self.DEPLOY_OFFSETS[i]
-        pos    = self.anymal_dest + offset
-
-        bot.pose[0]  = pos[0]
-        bot.pose[1]  = pos[1]
-        bot.pose[2]  = 0.0
-        self.pb_fsm[i] = PuzzleBotFSM.DEPLOYED
-
-        self._log(f"  PuzzleBot {i} (→box {self.pb_assignment[i]}) deployed at "
-                  f"({pos[0]:.2f}, {pos[1]:.2f})")
-        self.deploy_idx += 1
 
     # ── PHASE: STACKING ──────────────────────────────────────────────────────
 
@@ -411,7 +460,7 @@ class Coordinator:
         if fsm == PuzzleBotFSM.APPROACH:
             # Obstacles are the other PuzzleBots
             other_bots = [b for idx, b in enumerate(self.puzzlebots) if idx != i]
-            safe_target = self._get_avoidance_target(bot.pose, [box.x, box.y], other_bots, safe_dist=0.4)
+            safe_target = self._get_avoidance_target(bot, [box.x, box.y], other_bots, safe_dist=0.4)
             
             arrived = bot.navigate_to(safe_target, dt)
             bot.step(dt)
@@ -439,7 +488,7 @@ class Coordinator:
         # ── CARRYING: navigate to stack zone ─────────────────────────────────
         elif fsm == PuzzleBotFSM.CARRYING:
             other_bots = [b for idx, b in enumerate(self.puzzlebots) if idx != i]
-            safe_target = self._get_avoidance_target(bot.pose, self.stack_target, other_bots, safe_dist=0.4)
+            safe_target = self._get_avoidance_target(bot, self.stack_target, other_bots, safe_dist=0.4)
             
             arrived = bot.navigate_to(safe_target, dt)
             bot.step(dt)
@@ -493,32 +542,32 @@ class Coordinator:
                                       + off[0]*np.sin(th) + off[1]*np.cos(th))
         self.puzzlebots[i].pose[2] = th
         
-    def _get_avoidance_target(self, robot_pose, true_target, obstacles, safe_dist=0.7, k_rep=0.4):
+    def _get_avoidance_target(self, robot, true_target, obstacles, safe_dist=0.7, k_rep=0.4):
         """Calculates a virtual target using Artificial Potential Fields."""
-        rx, ry = robot_pose[0], robot_pose[1]
+        rx, ry = robot.x, robot.y
         tx, ty = true_target[0], true_target[1]
         
         # 1. Attractive vector towards the true target
         dx, dy = tx - rx, ty - ry
         dist_t = norm2(dx, dy)
+        
         if dist_t > 0:
             scale = min(1.0, dist_t)
             dx = (dx / dist_t) * scale
             dy = (dy / dist_t) * scale
             
-        # 2. Repulsive vectors away from obstacles
-        rep_x, rep_y = 0.0, 0.0
-        for obs in obstacles:
-            ox, oy = obs.x, obs.y
-            dist_o = norm2(rx - ox, ry - oy)
-            
-            if 0.01 < dist_o < safe_dist:
-                mag = k_rep * (1.0 / dist_o - 1.0 / safe_dist) / (dist_o**2)
-                rep_x += mag * (rx - ox) / dist_o
-                rep_y += mag * (ry - oy) / dist_o
-                
+            # 2. Repulsive vectors away from obstacles
+            rep_x, rep_y = 0.0, 0.0
+            for obs in obstacles:
+                ox, oy = obs.x, obs.y
+                dist_o = norm2(rx - ox, ry - oy)
+                if 0.01 < dist_o < safe_dist:
+                    mag = k_rep * (1.0 / dist_o - 1.0 / safe_dist) / (dist_o**2)
+                    rep_x += mag * (rx - ox) / dist_o
+                    rep_y += mag * (ry - oy) / dist_o
+
         # 3. Combine vectors to create a new virtual waypoint
-        return [rx + dx + rep_x, ry + dy + rep_y]
+        return [rx + dx + rep_x, ry + dy + rep_y] 
 
     # ── STATUS ────────────────────────────────────────────────────────────────
 

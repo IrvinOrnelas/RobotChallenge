@@ -25,6 +25,7 @@ from classes.husky.lidar import LiDAR
 from classes.anymal.anymal import Anymal
 from classes.puzzlebot.puzzlebot import PuzzleBot, PuzzleBotModel
 from classes.puzzlebot.puzzlebot_arm import PuzzleBotArm, PuzzleBotArmModel
+from classes.xram.lite_xarm import Lite6Arm
 from coordinator import Coordinator, Box, Zone
 
 # ── WORLD CONSTANTS ──────────────────────────────────────────────────────────
@@ -100,7 +101,7 @@ class Sim2D:
             
         # Define our Zones
         self.clear_zone = Zone('CLEAR ZONE', x_min=1.0, x_max=7.0, y_min=-1.0, y_max=1.0, color='#ef4444')
-        self.stack_zone = Zone('STACK ZONE', x_min=8.5, x_max=10.5, y_min=-1.0, y_max=1.0, color='#10b981')
+        self.stack_zone = Zone('STACK ZONE', x_min=8.5, x_max=11.5, y_min=-2.0, y_max=2.0, color='#10b981')
 
         # ANYmal destination
         ax.plot(7.5, 0, 'o', ms=8, mfc='none', mec='#a78bfa', mew=1.5, zorder=3)
@@ -110,33 +111,39 @@ class Sim2D:
      # ── BUILD ROBOTS ────────────────────────────────────────────────────────
     def build_robots(self):
         """Instantiate all robots and return coordinator."""
-        husky = Husky(pose=(1.5, -1.8, 0.0))
+        husky = Husky(pose=(1.3, -1.8, 0.0))
 
         anymal = Anymal(pose=(0.0, 0.0, 0.0), payload_kg=6.0)
 
         arm_model = PuzzleBotArmModel(l1=0.10, l2=0.08, l3=0.06)
         puzzlebots = [
-            PuzzleBot(i, pose=(9.5 + i * 0.5, 2.5, 0.0),
+            PuzzleBot(i, pose=(9.5, 2.5 + i * 0.5, 0.0),
                     arm=PuzzleBotArm(PuzzleBotArmModel()))
             for i in range(3)
         ]
         
         obstacle_boxes = [
-            Box('B1', 2.5,  0.0, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
+            Box('B1', 2.0,  0.0, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
             Box('B2', 4.0,  0.0, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
-            Box('B3', 5.5,  0.0, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
+            Box('B3', 6.0,  0.0, w=0.5, h=0.5, color='#8B4513', obstacle_box=True),
         ]
         # Small boxes in work zone — PuzzleBots stack these
         stack_boxes = [
-            Box('A', 10.0,  1.5, w=0.35, h=0.35, color='#ef4444'),
-            Box('B',  9.5,  3.0, w=0.35, h=0.35, color='#f59e0b'),
-            Box('C', 11.0,  2.0, w=0.35, h=0.35, color='#10b981'),
+            Box('A', 10.0,  -1.5, w=0.35, h=0.35, color='#ef4444'),
+            Box('B', 10.0,  0, w=0.35, h=0.35, color='#f59e0b'),
+            Box('C', 10.0,  1.5, w=0.35, h=0.35, color='#10b981'),
+        ]
+        
+        lite6_arms = [
+            Lite6Arm(0, 8.5,  0.8),
+            Lite6Arm(1, 8.5, -0.8)
         ]
 
         coord = Coordinator(husky, anymal, puzzlebots,
                             obstacle_boxes, stack_boxes,
                             self.clear_zone, self.stack_zone,
-                            anymal_dest=(7.5, 0),
+                            xarms=lite6_arms,
+                            anymal_dest=(8.0, 0),
                             stack_target=(9.0, 0.5),
                             lidar=self.lidar)
         return coord
@@ -162,6 +169,9 @@ class Sim2D:
         
         for bot in c.puzzlebots:
             self.visual_artists.extend(bot.setup_visuals(ax))
+            
+        for arm in c.xarms:
+            self.visual_artists.extend(arm.setup_visuals(ax))
 
         # ── LiDAR rays (Keep in sim.py since they are world-level) ──────────
         self.lidar_lines = [
@@ -279,6 +289,9 @@ class Sim2D:
         c.husky.update_visuals(self.ax)
         c.anymal.update_visuals(self.ax)
 
+        for bot in c.puzzlebots:
+            bot.update_visuals(self.ax)
+            
         for bot in c.puzzlebots:
             bot.update_visuals(self.ax)
 
