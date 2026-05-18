@@ -6,7 +6,6 @@ Renders all robots, boxes, zones and trails in real time.
 Run:
     python sim.py
     python sim.py --speed 5      # 5× real-time
-    python sim.py --no-lidar     # hide LiDAR rays
     python sim.py --save         # save MP4 instead of live display
 """
 import sys, os, argparse
@@ -38,7 +37,6 @@ from skimage.draw import line as draw_line
 sys.path.insert(0, '.')
 from utils import norm2, rad2deg
 from classes.husky.husky import Husky
-from classes.husky.lidar import LiDAR
 from classes.anymal.anymal import Anymal
 from classes.puzzlebot.puzzlebot import PuzzleBot, PuzzleBotModel
 from classes.puzzlebot.puzzlebot_arm import PuzzleBotArm, PuzzleBotArmModel
@@ -59,7 +57,6 @@ C_HUSKY    = '#0ea5e9'
 C_ANYMAL   = '#7c3aed'
 C_PB       = ['#fbbf24', '#34d399', '#f472b6']
 C_BOX      = {'A': '#ef4444', 'B': '#f59e0b', 'C': '#10b981'}
-C_LIDAR    = '#06b6d422'
 C_TEXT     = '#e2e8f0'
 C_DIM      = '#475569'
 
@@ -68,13 +65,11 @@ class Sim2D:
     2D top-down simulation with matplotlib FuncAnimation.
     """
 
-    def __init__(self, speed: float = 1.0, show_lidar: bool = True,
+    def __init__(self, speed: float = 1.0,
                  show_trails: bool = True, save: bool = False):
         self.speed = speed
-        self.show_lidar = show_lidar
         self.show_trails = show_trails
         self.save = save
-        self.lidar = LiDAR(n_rays=144, max_range=5.0, noise_std=0.01)
         self.t = 0.0
         self.step_count = 0
 
@@ -95,6 +90,10 @@ class Sim2D:
 
         self._setup_world()
         self.coord = self.build_robots()
+        # Train gradient-boosting steering on synthetic corridor images
+        print("[GB] Training GradientBoostingSteering on synthetic data…")
+        self.coord.gb_steering.train_on_synthetic(
+            self.coord.camera, self.coord.boxes, n_samples=600)
         self._setup_artists()
         self._setup_camera_panel()
         self._setup_metrics_panel()
@@ -173,8 +172,7 @@ class Sim2D:
                             self.clear_zone, self.stack_zone,
                             xarms=lite6_arms,
                             anymal_dest=(8.0, 0),
-                            stack_target=(10.0, 0.5),
-                            lidar=self.lidar)
+                            stack_target=(10.0, 0.5))
         return coord
 
     # ── ARTIST SETUP ────────────────────────────────────────────────────────
@@ -201,12 +199,6 @@ class Sim2D:
             
         for arm in c.xarms:
             self.visual_artists.extend(arm.setup_visuals(ax))
-
-        # ── LiDAR rays (Keep in sim.py since they are world-level) ──────────
-        self.lidar_lines = [
-            ax.plot([], [], '-', color=C_LIDAR, lw=0.3, zorder=2)[0]
-            for _ in range(self.lidar.n_rays)
-        ]
 
         # ── Time / Phase text ──────────────────────────────────────────────
         self.time_text  = ax.text(0.01, 0.99, '', transform=ax.transAxes,
@@ -363,7 +355,7 @@ class Sim2D:
         if img is None:
             return
 
-        # Apply Hough only when the ANYmal camera is active
+        # Hough overlay: only for ANYmal corridor lane detection
         if c.current_robot_name == 'ANYmal':
             display_img, n_seg = self._hough_overlay(img, c.last_cam_horizon)
             hough_info = f"  HOUGH:{n_seg}seg"
@@ -450,17 +442,6 @@ class Sim2D:
         for bot in c.puzzlebots:
             bot.update_visuals(self.ax)
 
-        # ── LiDAR ────────────────────────────────────────────────────────────
-        if self.show_lidar and c.phase.name == 'CLEARING':
-            obstacles = [{'x': b.x, 'y': b.y, 'w': b.w, 'h': b.h}
-                         for b in c.boxes]
-            ranges, angles = self.lidar.scan(c.husky.pose, obstacles)
-            pts = self.lidar.get_points(c.husky.pose, ranges, angles)
-            for i, (line, pt) in enumerate(zip(self.lidar_lines, pts)):
-                line.set_data([c.husky.x, pt[0]], [c.husky.y, pt[1]])
-        else:
-            for line in self.lidar_lines:
-                line.set_data([], [])
         # ── HUD ────────────────────────────────────────────────────────────
         self.time_text.set_text(f't = {c.t:.1f}s')
         self.phase_text.set_text(f'Phase: {c.phase.name}')
@@ -474,7 +455,7 @@ class Sim2D:
         # ── Info panel ─────────────────────────────────────────────────────
         self._update_info()
 
-        return (self.visual_artists + self.lidar_lines +
+        return (self.visual_artists +
                 [self.time_text, self.phase_text, self.cam_imshow, self.cam_text,
                  self.cam_title, *list(self.met_texts.values()),
                  *list(self.info_texts.values())])
@@ -509,19 +490,16 @@ class Sim2D:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='RobotChallenge 2D Simulator')
-    parser.add_argument('--speed',    type=float, default=1.0,
+    parser.add_argument('--speed',     type=float, default=1.0,
                         help='Simulation speed multiplier (default 1.0)')
-    parser.add_argument('--no-lidar', action='store_true',
-                        help='Disable LiDAR ray visualization')
-    parser.add_argument('--no-trails',action='store_true',
+    parser.add_argument('--no-trails', action='store_true',
                         help='Disable robot trails')
-    parser.add_argument('--save',     action='store_true',
+    parser.add_argument('--save',      action='store_true',
                         help='Save animation as robot_sim.mp4')
     args = parser.parse_args()
 
     sim = Sim2D(
         speed=args.speed,
-        show_lidar=not args.no_lidar,
         show_trails=not args.no_trails,
         save=args.save
     )

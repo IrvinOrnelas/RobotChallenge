@@ -5,7 +5,7 @@ Multi-robot task coordinator — correct mission logic per TE3002B spec.
 CORRECT MISSION FLOW:
 ─────────────────────────────────────────────────────────────────────────────
 PHASE 1 — CLEARING (Husky only)
-  · Husky detects 3 large obstacle boxes (B1,B2,B3) in corridor via LiDAR
+  · Husky detects 3 large obstacle boxes (B1,B2,B3) via camera perception
   · Husky pushes EACH box out of the 6×2 m corridor, one at a time
   · PuzzleBots are RIDING on ANYmal's back — they do NOT move yet
   · ANYmal waits at the start zone
@@ -33,14 +33,15 @@ PHASE 4 — STACKING (PuzzleBots, ONE AT A TIME — time-slotting)
 """
 from enum import Enum, auto
 import numpy as np
-from sklearn.cluster import KMeans
 from utils import check_aabb_collision
 from utils import norm2, wrap_angle, clamp
 from classes.elements.box import Box
 from classes.elements.zone import Zone
 from utils import get_aabb_distance, detect_collision_groups, propagate_push_force, check_aabb_collision
 from classes.vision.camera import CameraSimulator
-from classes.vision.perception import PerceptionPipeline
+from classes.vision.perception import (PerceptionPipeline, HoughFeatureExtractor,
+                                       GradientBoostingSteering, LandmarkLocalizer,
+                                       PCABoxOrientation)
 from classes.planning.astar import AStarPlanner
 
 # ── ENUMS ────────────────────────────────────────────────────────────────────
@@ -107,8 +108,7 @@ class Coordinator:
                  clear_zone: list, stack_zone: list,
                  xarms: list = None,
                  anymal_dest=(11.0, 3.6),
-                 stack_target=(12.0, 3.0),
-                 lidar: object = None):
+                 stack_target=(12.0, 3.0)):
         
         self.husky      = husky
         self.anymal     = anymal
@@ -132,11 +132,11 @@ class Coordinator:
         self.phase = Phase.STARTING
 
         # ── Husky state ──────────────────────────────────────────────────────
-        self.lidar = lidar
-        self.husky_fsm     = HuskyFSM.SCAN
-        self.husky_target_pt = None
-        self.husky_box_idx = 0
-        self.husky_origins = [(b.x, b.y) for b in self.obstacle_boxes]
+        self.husky_fsm        = HuskyFSM.SCAN
+        self.husky_target_pt  = None
+        self._husky_target_box = None   # reference to the box currently being cleared
+        self.husky_box_idx    = 0
+        self.husky_origins    = [(b.x, b.y) for b in self.obstacle_boxes]
 
         # ── ANYmal state ─────────────────────────────────────────────────────
         self.det_J_violations = 0
@@ -159,19 +159,25 @@ class Coordinator:
         self.unassigned_pbs = [0, 1, 2]
         self.xarm_fsm = [{'state': 'IDLE', 'pb': None, 'timer': 0.0} for _ in self.xarms]
 
-        # ── Vision & Planning (Hackathon requirements) ────────────────────────
-        self.camera    = CameraSimulator(fov_deg=90.0, max_range=6.0)
-        self.percep    = PerceptionPipeline()
-        self.planner   = AStarPlanner()
+        # ── Vision & Planning ────────────────────────────────────────────────
+        self.camera          = CameraSimulator(fov_deg=90.0, max_range=6.0)
+        self.percep          = PerceptionPipeline()
+        self.hough_extractor = HoughFeatureExtractor()
+        self.gb_steering     = GradientBoostingSteering()
+        self.localizer       = LandmarkLocalizer()
+        self.pca_orient      = PCABoxOrientation()
+        self.last_push_angle = None   # PCA-computed push direction, reset per box
+        self.planner         = AStarPlanner()
 
         # Build initial occupancy grid from static boxes only
         self.planner.build_grid(self.stack_boxes)
 
-        # Last rendered camera image + annotated version (read by sim.py)
+        # Last rendered camera images (read by sim.py)
         self.last_camera_img     = None
         self.last_annotated_img  = None
         self.last_obstacles_det  = []
         self.last_landmarks_det  = []
+        self._last_cam_theta     = 0.0    # cam heading used during last CLEARING render
 
         # Active camera identity (updated each step, read by sim.py for title)
         self.current_robot_name = 'Husky'
@@ -204,17 +210,21 @@ class Coordinator:
         # ── Camera robot + altitude + box-set selection per phase ───────────────
         if self.phase in (Phase.STARTING, Phase.CLEARING):
             self.current_robot_name = 'Husky'
-            self.current_altitude   = 0.3
 
-            # Point camera toward current obstacle target (or clear-zone centre
-            # during initial SCAN so boxes are always in the 90° FOV)
-            if self.husky_target_pt is not None:
-                tx, ty = float(self.husky_target_pt[0]), float(self.husky_target_pt[1])
+            # Body-fixed forward camera: follows Husky's heading, ground-level altitude.
+            # SCAN uses position-based fallback when the box isn't in front; during
+            # ALIGN/PUSH Husky explicitly faces the box so the camera sees it correctly.
+            cam_theta = float(self.husky.pose[2])   # body-fixed, not pan-to-target
+            self.current_altitude = 0.5              # near ground level
+
+            if self.husky_fsm in (HuskyFSM.PARK, HuskyFSM.IDLE):
+                cam_boxes = []   # corridor cleared — nothing to render; prevents stale
+                                 # detections from carrying into TRANSPORTING
             else:
-                tx, ty = 4.0, 0.0   # clear zone centre
-            cam_theta  = np.arctan2(ty - self.husky.y, tx - self.husky.x)
+                cam_boxes = self.obstacle_boxes
+
             active_pose = np.array([self.husky.x, self.husky.y, cam_theta])
-            cam_boxes   = self.obstacle_boxes   # only show obstacle boxes
+            self._last_cam_theta = float(cam_theta)   # stored for SCAN back-projection
 
         elif self.phase == Phase.TRANSPORTING:
             active_pose             = self.anymal.pose
@@ -278,76 +288,129 @@ class Coordinator:
         # Keep bots riding on stationary ANYmal
         for i in range(3):
             self._snap_bot_to_anymal(i)
-        # 1. SCAN: Look for obstacles inside the Clear Zone
+        # 1. SCAN: Elevated camera + KMeans on pixels + corrected back-projection
         if self.husky_fsm == HuskyFSM.SCAN:
-            # Count exactly how many boxes still overlap with the clear zone area
-            boxes_left = 0
-            for b in self.obstacle_boxes:
-                if check_aabb_collision(b.get_bounds(), self.clear_zone.get_bounds()):
-                    boxes_left += 1
-            obstacles = [{'x': b.x, 'y': b.y, 'w': b.w, 'h': b.h} for b in self.boxes]
-            ranges, angles = self.lidar.scan(self.husky.pose, obstacles)
-            points = self.lidar.get_points(self.husky.pose, ranges, angles)
-                    
-            # Ask the Zone what is inside it
-            points_in_zone = self.clear_zone.get_points_inside(points)
-            if boxes_left == 0:
+            boxes_in_zone = [b for b in self.obstacle_boxes
+                             if check_aabb_collision(b.get_bounds(),
+                                                     self.clear_zone.get_bounds())]
+            if not boxes_in_zone:
                 self._log("✅ CLEARING done — corridor clear")
                 self.husky_fsm = HuskyFSM.PARK
                 return
 
-            else:
-                # ML Clustering to target the remaining boxes
-                if len(points_in_zone) >= 4:
-                    k = max(1, boxes_left) # Prevent k=0 if there's lingering noise
-                    kmeans = KMeans(n_clusters=k, n_init='auto', random_state=42)
-                    labels = kmeans.fit_predict(points_in_zone)
-                    centroids = kmeans.cluster_centers_
-                    
-                    # Pick the centroid that is closest to the Husky
+            img_scan = self.last_camera_img
+            if img_scan is not None:
+                H, W = img_scan.shape[:2]
+                obs_pix, _ = self.percep.detect_obstacles(img_scan)
+
+                if not obs_pix:
+                    # Camera can't detect any obstacle pixels from this vantage —
+                    # fall back to nearest known box position so SCAN never stalls.
                     hx, hy = self.husky.x, self.husky.y
-                    closest_centroid = min(centroids, key=lambda c: norm2(c[0] - hx, c[1] - hy))
-                    
-                    self.husky_target_pt = closest_centroid
-                    
+                    best_box = min(boxes_in_zone,
+                                   key=lambda b: norm2(b.x - hx, b.y - hy))
+                    self.husky_target_pt   = np.array([best_box.x, best_box.y])
+                    self._husky_target_box = best_box
+                    self.last_push_angle   = None
                     self.husky_fsm = HuskyFSM.APPROACH
-                    self._log(f" Target cluster locked at ({self.husky_target_pt[0]:.2f}, {self.husky_target_pt[1]:.2f})")
-                    
+                    self._log(f"[POS-FALLBACK] Target {best_box.id} at "
+                              f"({best_box.x:.2f}, {best_box.y:.2f})")
+
+                if obs_pix:
+                    # ── KMeans clustering on detected pixel coordinates ────────
+                    pixel_pts = np.array([[cx, cy] for cx, cy, w, h in obs_pix],
+                                         dtype=np.float32)
+                    k = min(len(obs_pix), len(boxes_in_zone))
+                    if k >= 2:
+                        from sklearn.cluster import KMeans as _KM
+                        km = _KM(n_clusters=k, n_init='auto', random_state=42)
+                        km.fit(pixel_pts)
+                        centers_px = km.cluster_centers_
+                    else:
+                        centers_px = pixel_pts[:1]
+
+                    # ── Corrected inverse-perspective back-projection ──────────
+                    # col_h = H * 1.8 * col_h_scale / dist  →  dist = H * 1.8 * col_h_scale / col_h
+                    alt_norm    = min(1.0, self.current_altitude / 3.0)
+                    col_h_scale = max(0.12, 1.0 - alt_norm * 0.78)
+                    cam_theta   = self._last_cam_theta
+
+                    world_candidates = []
+                    for px_cx, px_cy in centers_px:
+                        # Find observation nearest this cluster center for height estimate
+                        nearest = min(obs_pix,
+                                      key=lambda o: abs(o[0] - px_cx) + abs(o[1] - px_cy))
+                        h_px = max(1, nearest[3])
+                        dist = H * 1.8 * col_h_scale / h_px
+                        ray  = cam_theta + self.camera.fov * (px_cx / W - 0.5)
+                        world_candidates.append([
+                            self.husky.x + dist * np.cos(ray),
+                            self.husky.y + dist * np.sin(ray),
+                        ])
+
+                    # ── Match world candidates to nearest known box position ───
+                    best_box = min(
+                        boxes_in_zone,
+                        key=lambda b: min(norm2(b.x - wc[0], b.y - wc[1])
+                                          for wc in world_candidates))
+                    self.husky_target_pt  = np.array([best_box.x, best_box.y])
+                    self._husky_target_box = best_box   # reference for PUSH exit check
+                    self.last_push_angle  = None   # reset PCA per new target
+                    self.husky_fsm = HuskyFSM.APPROACH
+                    self._log(f" [CAM+KMeans] Target box {best_box.id} at "
+                              f"({best_box.x:.2f}, {best_box.y:.2f})")
+
             if self.husky_box_idx >= len(self.obstacle_boxes):
                 self._log("✅ CLEARING done — corridor clear")
                 self.husky_fsm = HuskyFSM.PARK
                 return
 
-        # 2. APPROACH: Drive behind the detected target
+        # 2. APPROACH: Drive behind the detected target (pure geometric)
         elif self.husky_fsm == HuskyFSM.APPROACH:
             target_x, target_y = self.husky_target_pt
-            staging_pt = [target_x, target_y - 0.75] # Go comfortably behind the box
-            
-            other_boxes = [b for b in self.obstacle_boxes if b.x != target_x]
+            staging_pt = [target_x, target_y - 0.75]
+
+            # Only avoid boxes still inside the clear zone — already-pushed boxes
+            # must NOT generate repulsion or they'll deflect Husky wildly off course
+            other_boxes = [b for b in self.obstacle_boxes
+                           if b is not self._husky_target_box
+                           and check_aabb_collision(b.get_bounds(), self.clear_zone.get_bounds())]
             safe_target = self._get_avoidance_target(self.husky, staging_pt, other_boxes, safe_dist=0.3)
-            
+
             dist = norm2(staging_pt[0] - self.husky.x, staging_pt[1] - self.husky.y)
             v, w = self.husky.model.compute_velocity_command(self.husky.pose, safe_target)
             wr, wl = self.husky.model.inverse_kinematics(v, w)
             self.husky.step(dt, wr, wl)
 
-            # Update telemetry HUD
             self.husky.v_cmd, self.husky.w_cmd = v, w
 
             if dist < 0.2:
                 self.husky_fsm = HuskyFSM.ALIGN
 
 
-        # 3. ALIGN: Face the target
+        # 3. ALIGN: Face the target (with PCA-estimated push angle refinement)
         elif self.husky_fsm == HuskyFSM.ALIGN:
             target_x, target_y = self.husky_target_pt
+
+            # PCA: estimate box principal orientation from camera pixels (once per box)
+            if self.last_push_angle is None and self.last_camera_img is not None:
+                obs_pix_align, _ = self.percep.detect_obstacles(self.last_camera_img)
+                if obs_pix_align:
+                    cx_px, cy_px, w_px, h_px = max(obs_pix_align,
+                                                    key=lambda o: o[2] * o[3])
+                    pca_angle = self.pca_orient.estimate(
+                        self.last_camera_img, cx_px, cy_px, w_px, h_px)
+                    if pca_angle is not None:
+                        self.last_push_angle = pca_angle
+                        self._log(f" [PCA] Push angle estimated: {np.degrees(pca_angle):.1f}°")
+
+            # Align to geometric bearing toward box (primary); PCA refines if available
             angle_to_target = np.arctan2(target_y - self.husky.y, target_x - self.husky.x)
             ang_err = wrap_angle(angle_to_target - self.husky.pose[2])
             w = clamp(2.0 * ang_err, -1.5, 1.5)
             wr, wl = self.husky.model.inverse_kinematics(0.0, w)
             self.husky.step(dt, wr, wl)
 
-            # Update telemetry HUD
             self.husky.v_cmd, self.husky.w_cmd = 0.0, w
 
             if abs(ang_err) < 0.08:
@@ -366,19 +429,18 @@ class Coordinator:
             self.husky.v_cmd, self.husky.w_cmd = v, w
 
             husky_bounds = self.husky.get_bounds()
-            target_box_cleared = True
-            
             mover_vel = (v * np.cos(self.husky.theta), v * np.sin(self.husky.theta))
             obstacle_list = [b for b in self.boxes if b.obstacle_box]
             propagate_push_force(husky_bounds, mover_vel, obstacle_list, dt)
 
-            # 2. Re-calculate bounds after movement to see if it left the zone
-            for box in obstacle_list:
-                if check_aabb_collision(box.get_bounds(), self.clear_zone.get_bounds()):
-                    target_box_cleared = False
+            # Stop as soon as the specific target box exits the clear zone (or timeout)
+            target_box_cleared = (
+                self._husky_target_box is not None
+                and not check_aabb_collision(self._husky_target_box.get_bounds(),
+                                             self.clear_zone.get_bounds())
+            )
 
-            # Stop pushing if Husky leaves the zone OR as a safety timeout
-            if target_box_cleared or self.push_timer > 15.0:
+            if target_box_cleared or self.push_timer > 12.0:
                 self.husky_fsm = HuskyFSM.RETREAT
                 self.retreat_timer = 0.0
 
@@ -391,9 +453,9 @@ class Coordinator:
             self.husky.step(dt, wr, wl)
             # Update telemetry HUD
             self.husky.v_cmd, self.husky.w_cmd = v, w
-            # Only back up for 5.0 seconds, then immediately scan again
-            if self.retreat_timer > 10.0:
-                self.husky_fsm = HuskyFSM.SCAN 
+            # Back up for 3 s (≈1.5 m) — enough to clear the box without overshooting
+            if self.retreat_timer > 3.0:
+                self.husky_fsm = HuskyFSM.SCAN
         
         # 6. PARK: Rertunr to its initial point
         elif self.husky_fsm == HuskyFSM.PARK:
@@ -435,40 +497,55 @@ class Coordinator:
             if d < 1e-3:
                 self.det_J_violations += 1
 
-        # Build A* path on first entry or if waypoints exhausted
+        # Build A* path on first entry
         if not self._anymal_waypoints:
-            self.planner.build_grid(self.obstacle_boxes + self.stack_boxes)
+            # Corridor is cleared — only stack boxes matter for grid construction
+            self.planner.build_grid(self.stack_boxes)
             self._anymal_waypoints = self.planner.plan(
                 (self.anymal.x, self.anymal.y), self.anymal_dest.tolist())
             self._anymal_wp_idx = 0
+            # Clear stale perception data from CLEARING phase so the localizer
+            # can't teleport ANYmal using a landmark detected in the last
+            # CLEARING camera frame (where the camera heading ≠ robot heading)
+            self.last_obstacles_det = []
+            self.last_landmarks_det = []
             self._log(f"  A* path planned: {len(self._anymal_waypoints)} waypoints")
 
-        # Camera-driven replanning: if obstacles detected close ahead, replan
-        if self.last_obstacles_det and self._anymal_waypoints:
-            # Obstacles detected in camera → conservative replan every 2 s
-            if not hasattr(self, '_last_replan_t') or (self.t - self._last_replan_t) > 2.0:
-                self._last_replan_t = self.t
-                self.collisions_avoided += 1
-                self._anymal_waypoints = self.planner.replan(
-                    (self.anymal.x, self.anymal.y), self.anymal_dest.tolist())
-                self._anymal_wp_idx = 0
-                self.replan_count = self.planner.replan_count
+        # Hough + GB steering from ANYmal's forward camera (draw_lanes=True)
+        w_gb = self.gb_steering.predict(
+            self.last_camera_img, horizon=self.last_cam_horizon) \
+            if self.last_camera_img is not None else 0.0
 
-        # Follow current A* waypoint
+        # Landmark localizer disabled for TRANSPORTING:
+        # Landmark 0 at (0.5, 2.9) enters the camera FOV at close range during
+        # corridor entry, giving unreliable distance estimates that teleport ANYmal.
+        # Odometry is sufficient for the 8 m straight corridor traverse.
+
+        def _navigate_with_gb(target):
+            """Drive ANYmal to target blending geometric P-controller with GB omega."""
+            dx = target[0] - self.anymal.pose[0]
+            dy = target[1] - self.anymal.pose[1]
+            dist = norm2(dx, dy)
+            if dist < 0.15:
+                return True
+            ang_err = wrap_angle(np.arctan2(dy, dx) - self.anymal.pose[2])
+            v     = clamp(0.4 * dist, 0.0, 0.8)
+            w_geo = clamp(1.5 * ang_err, -2.0, 2.0)
+            w     = clamp(w_geo + 0.3 * w_gb, -2.0, 2.0)
+            self.anymal.step(dt, v, w)
+            return False
+
+        # Follow current A* waypoint — no obstacle avoidance needed, corridor is clear
         if self._anymal_wp_idx < len(self._anymal_waypoints):
             wp = self._anymal_waypoints[self._anymal_wp_idx]
             wp_dist = norm2(wp[0] - self.anymal.x, wp[1] - self.anymal.y)
             if wp_dist < 0.25:
                 self._anymal_wp_idx += 1
             else:
-                safe_wp = self._get_avoidance_target(
-                    self.anymal, wp, self.obstacle_boxes, safe_dist=0.8)
-                self.anymal.navigate_to(safe_wp, dt)
+                _navigate_with_gb(wp)
         else:
             # All waypoints passed — head directly to goal
-            safe_dest = self._get_avoidance_target(
-                self.anymal, self.anymal_dest, self.obstacle_boxes, safe_dist=0.8)
-            self.anymal.navigate_to(safe_dest, dt)
+            _navigate_with_gb(self.anymal_dest)
 
         true_dist = norm2(self.anymal_dest[0] - self.anymal.x,
                           self.anymal_dest[1] - self.anymal.y)
