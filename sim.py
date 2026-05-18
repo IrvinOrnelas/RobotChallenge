@@ -9,14 +9,30 @@ Run:
     python sim.py --no-lidar     # hide LiDAR rays
     python sim.py --save         # save MP4 instead of live display
 """
-import sys, argparse
+import sys, os, argparse
 import numpy as np
 import matplotlib
+
+# If a display is available, prefer an interactive backend instead of Agg.
+if os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'):
+    if matplotlib.get_backend().lower() == 'agg':
+        for candidate in ['qtagg', 'gtk4agg', 'gtk3agg', 'tkagg', 'qt5agg', 'wxagg']:
+            try:
+                matplotlib.use(candidate, force=True)
+                if matplotlib.get_backend().lower() != 'agg':
+                    break
+            except Exception:
+                continue
+
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.gridspec as gridspec
 import matplotlib.animation as animation
 from matplotlib.lines import Line2D
+from skimage.color import rgb2gray
+from skimage.feature import canny
+from skimage.transform import probabilistic_hough_line
+from skimage.draw import line as draw_line
 
 # ── project imports ──────────────────────────────────────────────────────────
 sys.path.insert(0, '.')
@@ -64,7 +80,7 @@ class Sim2D:
 
         # ── figure setup ────────────────────────────────────────────────────
         plt.style.use('dark_background')
-        self.fig = plt.figure(figsize=(22, 7), facecolor=C_BG)
+        self.fig = plt.figure(figsize=(22, 7), facecolor=C_BG, constrained_layout=True)
         gs = gridspec.GridSpec(
             2, 3,
             figure=self.fig,
@@ -83,8 +99,6 @@ class Sim2D:
         self._setup_camera_panel()
         self._setup_metrics_panel()
         self._setup_info_panel()
-
-        self.fig.tight_layout(pad=1.2)
 
     # ── WORLD SETUP ──────────────────────────────────────────────────────────
 
@@ -109,6 +123,14 @@ class Sim2D:
         # Define our Zones
         self.clear_zone = Zone('CLEAR ZONE', x_min=1.0, x_max=7.0, y_min=-1.0, y_max=1.0, color='#ef4444')
         self.stack_zone = Zone('STACK ZONE', x_min=8.5, x_max=11.5, y_min=-2.0, y_max=2.0, color='#10b981')
+
+        # ANYmal lane lines: center (white) + 2 laterals (yellow), x∈[0,8]
+        ax.plot([0, 8], [0,    0   ], '--', color='#ffffff', lw=0.9,
+                alpha=0.55, zorder=1, dashes=(6, 4))
+        ax.plot([0, 8], [ 0.5,  0.5], '--', color='#fbbf24', lw=0.7,
+                alpha=0.45, zorder=1, dashes=(4, 5))
+        ax.plot([0, 8], [-0.5, -0.5], '--', color='#fbbf24', lw=0.7,
+                alpha=0.45, zorder=1, dashes=(4, 5))
 
         # ANYmal destination
         ax.plot(8.0, 0, 'o', ms=8, mfc='none', mec='#a78bfa', mew=1.5, zorder=3)
@@ -309,20 +331,56 @@ class Sim2D:
 
     # ── UPDATE FRAME ─────────────────────────────────────────────────────────
 
-    def _update_camera(self):
-        """Display latest annotated camera image in the camera panel."""
-        c = self.coord
-        if c.last_annotated_img is not None:
-            self.cam_imshow.set_data(c.last_annotated_img)
+    def _hough_overlay(self, img: np.ndarray, horizon: int) -> tuple:
+        """
+        Run Canny + probabilistic Hough on the floor region of *img*.
+        Returns (overlaid_img, n_segments).
+        """
+        out = img.copy()
+        gray = rgb2gray(img)
 
-        # Dynamic title: robot name + current altitude
+        # Restrict edge detection to floor region (below horizon)
+        floor_gray = np.zeros_like(gray)
+        floor_gray[horizon:] = gray[horizon:]
+
+        edges = canny(floor_gray, sigma=1.2, low_threshold=0.08,
+                      high_threshold=0.20)
+        segments = probabilistic_hough_line(
+            edges, threshold=12, line_length=18, line_gap=6)
+
+        for (x0, y0), (x1, y1) in segments:
+            rr, cc = draw_line(y0, x0, y1, x1)
+            valid  = (rr >= 0) & (rr < out.shape[0]) & \
+                     (cc >= 0) & (cc < out.shape[1])
+            out[rr[valid], cc[valid]] = (0, 255, 160)   # bright green
+
+        return out, len(segments)
+
+    def _update_camera(self):
+        """Display latest annotated camera image with Hough lane overlays."""
+        c = self.coord
+        img = c.last_annotated_img
+        if img is None:
+            return
+
+        # Apply Hough only when the ANYmal camera is active
+        if c.current_robot_name == 'ANYmal':
+            display_img, n_seg = self._hough_overlay(img, c.last_cam_horizon)
+            hough_info = f"  HOUGH:{n_seg}seg"
+        else:
+            display_img = img
+            hough_info  = ""
+
+        self.cam_imshow.set_data(display_img)
+
         self.cam_title.set_text(
             f'CAMERA ({c.current_robot_name} POV)  z={c.current_altitude:.1f}m')
 
         obs_n  = len(c.last_obstacles_det)
         lm_n   = len(c.last_landmarks_det)
         lm_ids = [f"LM{l[0]}" for l in c.last_landmarks_det]
-        self.cam_text.set_text(f"OBS:{obs_n}  LM:{lm_n} {' '.join(lm_ids)}")
+        self.cam_text.set_text(
+            f"OBS:{obs_n}  LM:{lm_n} {' '.join(lm_ids)}{hough_info}")
 
     def _update_metrics(self):
         """Update hackathon metrics panel."""
@@ -437,8 +495,13 @@ class Sim2D:
             ani.save('robot_sim.mp4', writer=writer)
             print("Saved.")
         else:
-            plt.title('TE3002B — Almacén Robótico Colaborativo',
-                      color=C_TEXT, fontfamily='monospace', fontsize=10, pad=8)
+            backend = matplotlib.get_backend().lower()
+            if 'agg' in backend and 'tkagg' not in backend and 'qt' not in backend:
+                print(f"Non-interactive backend '{matplotlib.get_backend()}'; skipping live display.")
+                print("Run with --save to write robot_sim.mp4 instead.")
+                return
+            self.fig.suptitle('TE3002B — Almacén Robótico Colaborativo',
+                              color=C_TEXT, fontfamily='monospace', fontsize=10, y=0.98)
             plt.show()
 
 

@@ -47,19 +47,27 @@ class CameraSimulator:
 
     # ── PUBLIC API ───────────────────────────────────────────────────────────
 
+    # Lane line definitions: (world_y, rgb_color)
+    LANE_LINES = [
+        ( 0.0, (255, 255, 255)),   # center — white
+        ( 0.5, (255, 210,   0)),   # left lateral — yellow
+        (-0.5, (255, 210,   0)),   # right lateral — yellow
+    ]
+    # Camera height above floor for floor-projection (metres)
+    _CAM_HEIGHT = 0.55
+
     def render(self, robot_pose, boxes, other_robots=None,
-               altitude: float = 0.0) -> np.ndarray:
+               altitude: float = 0.0, draw_lanes: bool = False) -> np.ndarray:
         """
         Render a synthetic RGB image from *robot_pose* = [x, y, theta].
 
         Parameters
         ----------
-        robot_pose : (x, y, theta) of the camera-carrying robot
-        boxes      : list of Box objects (obstacle + stack boxes)
-        other_robots : list of other robot entities (optional)
-        altitude   : camera height in metres (0 = ground, 3 = max drone height).
-                     Higher values shift the horizon up, shrink objects, and add
-                     a floor-perspective grid (drone-like appearance).
+        robot_pose  : (x, y, theta) of the camera-carrying robot
+        boxes       : list of Box objects (obstacle + stack boxes)
+        other_robots: list of other robot entities (optional)
+        altitude    : camera height in metres (0 = ground, 3 = max height)
+        draw_lanes  : if True, project LANE_LINES onto the floor region
 
         Returns
         -------
@@ -121,6 +129,10 @@ class CameraSimulator:
                 img[gr, :] = np.clip(
                     img[gr, :].astype(np.int16) + strength, 0, 255)
 
+        # ── Floor lane lines (perspective projection) ────────────────────────
+        if draw_lanes:
+            self._draw_floor_lanes(img, rx, ry, rth)
+
         # ── Landmarks ────────────────────────────────────────────────────────
         self._draw_landmarks(img, rx, ry, rth)
 
@@ -131,6 +143,44 @@ class CameraSimulator:
         return img
 
     # ── INTERNAL HELPERS ─────────────────────────────────────────────────────
+
+    def _draw_floor_lanes(self, img, rx, ry, rth):
+        """
+        Inverse-perspective project LANE_LINES onto the floor region of img.
+        Each floor pixel's world position is computed analytically; pixels that
+        fall on a lane stripe are recolored with perspective-correct shading.
+        """
+        focal = (self.W / 2.0) / np.tan(self.fov / 2.0)
+        h_cam = self._CAM_HEIGHT
+        cos_th, sin_th = np.cos(rth), np.sin(rth)
+
+        cols = np.arange(self.W, dtype=np.float32)
+        x_screen = cols - self.W / 2.0          # (W,) lateral pixel offset
+
+        for r in range(self.horizon + 1, self.H):
+            y_screen = r - self.horizon           # pixels below horizon
+            depth = h_cam * focal / y_screen      # metres to floor point
+            if depth > self.max_range:
+                continue
+
+            # World-space lateral offset for every column
+            lateral = x_screen * (depth / focal)  # (W,)
+
+            # World Y coordinate of each floor pixel in this row
+            wy = ry + depth * sin_th + lateral * cos_th   # (W,)
+
+            shade = float(np.clip(1.0 - depth / self.max_range, 0.25, 1.0))
+            # Perspective-correct stripe half-width: 2 px projected to world
+            tol = max(0.035, 2.0 * depth / focal)
+
+            for lane_y, color in self.LANE_LINES:
+                mask = np.abs(wy - lane_y) < tol
+                if mask.any():
+                    img[r, mask] = (
+                        int(color[0] * shade),
+                        int(color[1] * shade),
+                        int(color[2] * shade),
+                    )
 
     def _cast_ray(self, rx, ry, angle, boxes, other_robots):
         dx = np.cos(angle)

@@ -176,6 +176,7 @@ class Coordinator:
         # Active camera identity (updated each step, read by sim.py for title)
         self.current_robot_name = 'Husky'
         self.current_altitude   = 0.3   # metres
+        self.last_cam_horizon   = 90    # pixel row of horizon in last camera frame
 
         # Metrics tracked for the hackathon rubric
         self.cmax_timer          = 0.0   # makespan (total mission time)
@@ -236,8 +237,11 @@ class Coordinator:
             self.current_altitude   = 1.5
             cam_boxes = self.stack_boxes
 
+        draw_lanes = self.current_robot_name == 'ANYmal'
         self.last_camera_img = self.camera.render(
-            active_pose, cam_boxes, altitude=self.current_altitude)
+            active_pose, cam_boxes, altitude=self.current_altitude,
+            draw_lanes=draw_lanes)
+        self.last_cam_horizon = self.camera.horizon
         annotated, obs, lms  = self.percep.annotate(self.last_camera_img)
         self.last_annotated_img = annotated
         self.last_obstacles_det = obs
