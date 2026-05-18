@@ -152,11 +152,6 @@ class AnymalLegModel:
         """τ = Jᵀ · f  (exam Q6)"""
         return self.jacobian(q1, q2, q3).T @ f
 
-    def det_jacobian(self, q0, q1, q2) -> float:
-        return float(np.linalg.det(self.jacobian(q0, q1, q2)))
-
-    def is_singular(self, q0, q1, q2, threshold=1e-3) -> bool:
-        return abs(self.det_jacobian(q0, q1, q2)) < threshold
 
 
 class AnymalLeg:
@@ -377,3 +372,23 @@ class Anymal:
         # Update all legs
         for leg in self.legs.values():
             leg.update_visuals(self.pose)
+            
+    def get_bounds(self):
+        """
+        Calcula la caja delimitadora (AABB) del robot ANYmal.
+        Se basa en su cuerpo elíptico (0.7m x 0.4m) y toma en cuenta su rotación actual.
+        Retorna: (min_x, min_y, max_x, max_y)
+        """
+        a = 0.35  # Semieje mayor (mitad de 0.7)
+        b = 0.20  # Semieje menor (mitad de 0.4)
+        
+        # Fórmulas paramétricas para los límites de una elipse rotada
+        hx = np.sqrt((a * np.cos(self.theta))**2 + (b * np.sin(self.theta))**2)
+        hy = np.sqrt((a * np.sin(self.theta))**2 + (b * np.cos(self.theta))**2)
+        
+        min_x = self.x - hx
+        min_y = self.y - hy
+        max_x = self.x + hx
+        max_y = self.y + hy
+        
+        return (min_x, min_y, max_x, max_y)

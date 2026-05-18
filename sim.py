@@ -14,6 +14,7 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import matplotlib.gridspec as gridspec
 import matplotlib.animation as animation
 from matplotlib.lines import Line2D
 
@@ -57,27 +58,33 @@ class Sim2D:
         self.show_lidar = show_lidar
         self.show_trails = show_trails
         self.save = save
-        self.lidar = LiDAR(n_rays=72, max_range=5.0, noise_std=0.01)
+        self.lidar = LiDAR(n_rays=144, max_range=5.0, noise_std=0.01)
         self.t = 0.0
         self.step_count = 0
 
         # ── figure setup ────────────────────────────────────────────────────
         plt.style.use('dark_background')
-        self.fig, self.axes = plt.subplots(
-            1, 2,
-            figsize=(16, 7),
-            gridspec_kw={'width_ratios': [3, 1]},
-            facecolor=C_BG
+        self.fig = plt.figure(figsize=(22, 7), facecolor=C_BG)
+        gs = gridspec.GridSpec(
+            2, 3,
+            figure=self.fig,
+            width_ratios=[3, 1.1, 1],
+            height_ratios=[1, 1],
+            hspace=0.08, wspace=0.22
         )
-        self.ax   = self.axes[0]   # main simulation view
-        self.ax_i = self.axes[1]   # info panel
+        self.ax     = self.fig.add_subplot(gs[:, 0])   # world (full height, left)
+        self.ax_cam = self.fig.add_subplot(gs[0, 1])   # camera feed (top centre-right)
+        self.ax_met = self.fig.add_subplot(gs[1, 1])   # metrics (bottom centre-right)
+        self.ax_i   = self.fig.add_subplot(gs[:, 2])   # telemetry (full height, right)
 
         self._setup_world()
         self.coord = self.build_robots()
         self._setup_artists()
+        self._setup_camera_panel()
+        self._setup_metrics_panel()
         self._setup_info_panel()
 
-        self.fig.tight_layout(pad=1.5)
+        self.fig.tight_layout(pad=1.2)
 
     # ── WORLD SETUP ──────────────────────────────────────────────────────────
 
@@ -104,8 +111,8 @@ class Sim2D:
         self.stack_zone = Zone('STACK ZONE', x_min=8.5, x_max=11.5, y_min=-2.0, y_max=2.0, color='#10b981')
 
         # ANYmal destination
-        ax.plot(7.5, 0, 'o', ms=8, mfc='none', mec='#a78bfa', mew=1.5, zorder=3)
-        ax.text(7.6, 0.05, 'p_dest', color='#a78bfa', fontsize=7,
+        ax.plot(8.0, 0, 'o', ms=8, mfc='none', mec='#a78bfa', mew=1.5, zorder=3)
+        ax.text(8.1, 0.05, 'p_dest', color='#a78bfa', fontsize=7,
                 fontfamily='monospace', zorder=3)
     
      # ── BUILD ROBOTS ────────────────────────────────────────────────────────
@@ -144,7 +151,7 @@ class Sim2D:
                             self.clear_zone, self.stack_zone,
                             xarms=lite6_arms,
                             anymal_dest=(8.0, 0),
-                            stack_target=(9.0, 0.5),
+                            stack_target=(10.0, 0.5),
                             lidar=self.lidar)
         return coord
 
@@ -186,6 +193,64 @@ class Sim2D:
         self.phase_text = ax.text(0.01, 0.93, '', transform=ax.transAxes,
                                    color='#f59e0b', fontsize=8, fontfamily='monospace',
                                    va='top', zorder=10)
+
+    # ── CAMERA PANEL ─────────────────────────────────────────────────────────
+
+    def _setup_camera_panel(self):
+        ax = self.ax_cam
+        ax.set_facecolor('#050a14')
+        ax.axis('off')
+        # Placeholder 320×180 black image
+        blank = np.zeros((180, 320, 3), dtype=np.uint8)
+        self.cam_imshow = ax.imshow(blank, aspect='auto',
+                                    interpolation='nearest', zorder=2)
+        ax.set_title('')   # title is updated dynamically each frame
+        self.cam_title = ax.text(
+            0.5, 1.02, 'CAMERA', transform=ax.transAxes,
+            color='#64748b', fontsize=7, fontfamily='monospace',
+            ha='center', va='bottom', zorder=6)
+        # Overlay text for perception stats
+        self.cam_text = ax.text(0.02, 0.97, '', transform=ax.transAxes,
+                                color='#00ff88', fontsize=6,
+                                fontfamily='monospace', va='top', zorder=5)
+
+    # ── METRICS PANEL ────────────────────────────────────────────────────────
+
+    def _setup_metrics_panel(self):
+        ax = self.ax_met
+        ax.set_facecolor(C_BG)
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        ax.axis('off')
+        ax.text(0.05, 0.96, 'HACKATHON METRICS', color='#64748b',
+                fontsize=7, fontfamily='monospace', va='top', fontweight='bold')
+        ax.text(0.05, 0.88, '─' * 20, color='#1e293b',
+                fontsize=6, fontfamily='monospace', va='top')
+
+        self.met_texts = {}
+        rows = [
+            ('cmax',     'Cmax (makespan)',  0.80),
+            ('replans',  'Replans (A*)',     0.70),
+            ('avoided',  'Cols avoided',     0.60),
+            ('obs_seen', 'Obstacles seen',   0.50),
+            ('lms_seen', 'Landmarks seen',   0.40),
+            ('sep_m',    '─' * 20,           0.30),
+            ('task_C',   'Box C placed',     0.22),
+            ('task_B',   'Box B placed',     0.14),
+            ('task_A',   'Box A placed',     0.06),
+        ]
+        for key, lbl, y in rows:
+            if key.startswith('sep'):
+                ax.text(0.05, y, lbl, color='#1e293b',
+                        fontsize=6, fontfamily='monospace', va='top')
+                self.met_texts[key] = ax.text(0.05, y, lbl, color='#1e293b',
+                                              fontsize=6, fontfamily='monospace',
+                                              va='top')
+            else:
+                ax.text(0.04, y, lbl + ':', color='#64748b',
+                        fontsize=6.5, fontfamily='monospace', va='top')
+                self.met_texts[key] = ax.text(0.62, y, '—', color=C_TEXT,
+                                              fontsize=6.5, fontfamily='monospace',
+                                              va='top')
 
     # ── INFO PANEL ───────────────────────────────────────────────────────────
 
@@ -243,6 +308,38 @@ class Sim2D:
                     fontsize=6, fontfamily='monospace', va='top')
 
     # ── UPDATE FRAME ─────────────────────────────────────────────────────────
+
+    def _update_camera(self):
+        """Display latest annotated camera image in the camera panel."""
+        c = self.coord
+        if c.last_annotated_img is not None:
+            self.cam_imshow.set_data(c.last_annotated_img)
+
+        # Dynamic title: robot name + current altitude
+        self.cam_title.set_text(
+            f'CAMERA ({c.current_robot_name} POV)  z={c.current_altitude:.1f}m')
+
+        obs_n  = len(c.last_obstacles_det)
+        lm_n   = len(c.last_landmarks_det)
+        lm_ids = [f"LM{l[0]}" for l in c.last_landmarks_det]
+        self.cam_text.set_text(f"OBS:{obs_n}  LM:{lm_n} {' '.join(lm_ids)}")
+
+    def _update_metrics(self):
+        """Update hackathon metrics panel."""
+        c   = self.coord
+        m   = c.status().get('metrics', {})
+        sb  = {b.id: b.stacked for b in c.stack_boxes}
+
+        self.met_texts['cmax'].set_text(f"{m.get('cmax', 0):.1f} s")
+        self.met_texts['replans'].set_text(str(m.get('replans', 0)))
+        self.met_texts['avoided'].set_text(str(m.get('collisions_avoided', 0)))
+        self.met_texts['obs_seen'].set_text(str(m.get('obstacles_seen', 0)))
+        self.met_texts['lms_seen'].set_text(str(m.get('landmarks_seen', 0)))
+
+        for box_id, key in [('C', 'task_C'), ('B', 'task_B'), ('A', 'task_A')]:
+            placed = sb.get(box_id, False)
+            self.met_texts[key].set_text('✓' if placed else '…')
+            self.met_texts[key].set_color('#10b981' if placed else '#f59e0b')
 
     def _update_info(self):
         c = self.coord
@@ -310,10 +407,19 @@ class Sim2D:
         self.time_text.set_text(f't = {c.t:.1f}s')
         self.phase_text.set_text(f'Phase: {c.phase.name}')
 
+        # ── Camera panel ───────────────────────────────────────────────────
+        self._update_camera()
+
+        # ── Metrics panel ──────────────────────────────────────────────────
+        self._update_metrics()
+
         # ── Info panel ─────────────────────────────────────────────────────
         self._update_info()
 
-        return self.visual_artists + self.lidar_lines + [self.time_text, self.phase_text, *list(self.info_texts.values())]
+        return (self.visual_artists + self.lidar_lines +
+                [self.time_text, self.phase_text, self.cam_imshow, self.cam_text,
+                 self.cam_title, *list(self.met_texts.values()),
+                 *list(self.info_texts.values())])
 
     # ── RUN ─────────────────────────────────────────────────────────────────
 
