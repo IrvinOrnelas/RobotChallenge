@@ -57,7 +57,7 @@ class Sim2D:
         self.show_lidar = show_lidar
         self.show_trails = show_trails
         self.save = save
-        self.lidar = LiDAR(n_rays=72, max_range=5.0, noise_std=0.01)
+        self.lidar = LiDAR(n_rays=144, max_range=5.0, noise_std=0.01)
         self.t = 0.0
         self.step_count = 0
 
@@ -144,7 +144,7 @@ class Sim2D:
                             self.clear_zone, self.stack_zone,
                             xarms=lite6_arms,
                             anymal_dest=(8.0, 0),
-                            stack_target=(9.0, 0.5),
+                            stack_target=(10.0, 0.5),
                             lidar=self.lidar)
         return coord
 

@@ -58,6 +58,7 @@ class HuskyFSM(Enum):
     ALIGN    = auto()
     PUSH     = auto()
     RETREAT  = auto()
+    PARK     = auto()
     IDLE     = auto()
 
 
@@ -69,6 +70,7 @@ class PuzzleBotFSM(Enum):
     CARRYING = auto()   # driving to stack while holding box
     PLACING  = auto()   # arm lowering box onto stack
     DONE     = auto()
+    PARKING  = auto()
 
 
 # ── COORDINATOR ───────────────────────────────────────────────────────────────
@@ -85,9 +87,9 @@ class Coordinator:
 
     # Where each PuzzleBot is placed after ANYmal arrives (relative to pdest)
     DEPLOY_OFFSETS = [
-        np.array([ 0.0,  0.5]),
-        np.array([ 0.0,  0.0]),
-        np.array([ 0.0, -0.5]),
+        np.array([ 1.0,  0.5]),
+        np.array([ 1.0,  0.0]),
+        np.array([ 1.0, -0.5]),
     ]
 
     # Riding offsets on ANYmal's back (body frame x-forward, y-left)
@@ -178,13 +180,12 @@ class Coordinator:
 
     def _do_starting(self):
         """Put all PuzzleBots on ANYmal and start clearing."""
+        self.husky_home = [self.husky.x, self.husky.y]
         for i in range(3):
             self._snap_bot_to_anymal(i)
             self.pb_fsm[i] = PuzzleBotFSM.RIDING
         self._log("═══ PHASE 1: CLEARING — Husky pushes obstacle boxes out of corridor ═══")
         self.phase = Phase.CLEARING
-
-    # ── PHASE: CLEARING ──────────────────────────────────────────────────────
 
      # ── PHASE: CLEARING ──────────────────────────────────────────────────────
 
@@ -204,7 +205,6 @@ class Coordinator:
             for b in self.obstacle_boxes:
                 if check_aabb_collision(b.get_bounds(), self.clear_zone.get_bounds()):
                     boxes_left += 1
-                    
             obstacles = [{'x': b.x, 'y': b.y, 'w': b.w, 'h': b.h} for b in self.boxes]
             ranges, angles = self.lidar.scan(self.husky.pose, obstacles)
             points = self.lidar.get_points(self.husky.pose, ranges, angles)
@@ -213,13 +213,12 @@ class Coordinator:
             points_in_zone = self.clear_zone.get_points_inside(points)
             if boxes_left == 0:
                 self._log("✅ CLEARING done — corridor clear")
-                self._log("═══ PHASE 2: TRANSPORTING — ANYmal walks to work zone ═══")
-                self.phase = Phase.TRANSPORTING
+                self.husky_fsm = HuskyFSM.PARK
                 return
 
             else:
                 # ML Clustering to target the remaining boxes
-                if len(points_in_zone) >= 5:
+                if len(points_in_zone) >= 4:
                     k = max(1, boxes_left) # Prevent k=0 if there's lingering noise
                     kmeans = KMeans(n_clusters=k, n_init='auto', random_state=42)
                     labels = kmeans.fit_predict(points_in_zone)
@@ -236,8 +235,7 @@ class Coordinator:
                     
             if self.husky_box_idx >= len(self.obstacle_boxes):
                 self._log("✅ CLEARING done — corridor clear")
-                self._log("═══ PHASE 2: TRANSPORTING — ANYmal walks to work zone ═══")
-                self.phase = Phase.TRANSPORTING
+                self.husky_fsm = HuskyFSM.PARK
                 return
 
         # 2. APPROACH: Drive behind the detected target
@@ -246,7 +244,7 @@ class Coordinator:
             staging_pt = [target_x, target_y - 0.75] # Go comfortably behind the box
             
             other_boxes = [b for b in self.obstacle_boxes if b.x != target_x]
-            safe_target = self._get_avoidance_target(self.husky, staging_pt, other_boxes, safe_dist=0.3)
+            safe_target = self._get_avoidance_target(self.husky, staging_pt, other_boxes, safe_dist=0.1)
             
             dist = norm2(staging_pt[0] - self.husky.x, staging_pt[1] - self.husky.y)
             v, w = self.husky.model.compute_velocity_command(self.husky.pose, safe_target)
@@ -314,8 +312,31 @@ class Coordinator:
             # Update telemetry HUD
             self.husky.v_cmd, self.husky.w_cmd = v, w
             # Only back up for 5.0 seconds, then immediately scan again
-            if self.retreat_timer > 5.0:
+            if self.retreat_timer > 10.0:
                 self.husky_fsm = HuskyFSM.SCAN 
+        
+        # 6. PARK: Rertunr to its initial point
+        elif self.husky_fsm == HuskyFSM.PARK:
+            dist = norm2(self.husky_home[0] - self.husky.x, self.husky_home[1] - self.husky.y)
+            
+            # Navigation avoiding the boxes using potential vortex (AABB + Vortex)
+            safe_target = self._get_avoidance_target(self.husky, self.husky_home, self.obstacle_boxes, safe_dist=0.2)
+            v, w = self.husky.model.compute_velocity_command(self.husky.pose, safe_target)
+            wr, wl = self.husky.model.inverse_kinematics(v, w)
+            self.husky.step(dt, wr, wl)
+            self.husky.v_cmd, self.husky.w_cmd = v, w
+            
+            if dist < 0.3: 
+                # Off motors
+                wr, wl = self.husky.model.inverse_kinematics(0.0, 0.0)
+                self.husky.step(dt, wr, wl)
+                self.husky.v_cmd, self.husky.w_cmd = 0.0, 0.0
+                
+                self.husky_fsm = HuskyFSM.IDLE
+                self._log("✅ CLEARING done — Husky parked successfully.")
+                self._log("═══ PHASE 2: TRANSPORTING — ANYmal walks to work zone ═══")
+                
+                self.phase = Phase.TRANSPORTING
 
     # ── PHASE: TRANSPORTING ───────────────────────────────────────────────────
 
@@ -335,7 +356,7 @@ class Coordinator:
                 self.det_J_violations += 1
 
         # Calculate APF steering
-        safe_dest = self._get_avoidance_target(self.anymal, self.anymal_dest, self.obstacle_boxes, safe_dist=1.0)
+        safe_dest = self._get_avoidance_target(self.anymal, self.anymal_dest, self.obstacle_boxes, safe_dist=0.5)
         self.anymal.navigate_to(safe_dest, dt)
         
         true_dist = norm2(self.anymal_dest[0] - self.anymal.x, 
@@ -460,7 +481,7 @@ class Coordinator:
         if fsm == PuzzleBotFSM.APPROACH:
             # Obstacles are the other PuzzleBots
             other_bots = [b for idx, b in enumerate(self.puzzlebots) if idx != i]
-            safe_target = self._get_avoidance_target(bot, [box.x, box.y], other_bots, safe_dist=0.4)
+            safe_target = self._get_avoidance_target(bot, [box.x, box.y], other_bots, safe_dist=0.1, containment_zone=self.stack_zone)
             
             arrived = bot.navigate_to(safe_target, dt)
             bot.step(dt)
@@ -479,7 +500,28 @@ class Coordinator:
             f_grip = np.array([0.0, 0.0, -5.0])
             tau    = bot.arm.force_to_torque(f_grip)
 
-            if self.grasp_timer[i] > 0.6:
+            if self.grasp_timer[i] > 0.8:
+                error_x = np.random.uniform(-0.01, 0.01)
+                error_y = np.random.uniform(-0.01, 0.01)
+                
+                box.x          = self.stack_target[0] + error_x
+                box.y          = self.stack_target[1] + error_y
+                box.stack_layer = layer
+                box.stacked    = True
+                box.carried_by = None
+                bot.arm.home()
+                
+                if not self.check_stack_stability():
+                    self.phase = Phase.ERROR
+                    self._log("❌ ERROR CRÍTICO: La torre colapsó por inestabilidad física.")
+                    return
+                
+                self.pb_fsm[i] = PuzzleBotFSM.PARKING
+                self._log(f"  [Slot {i}] ✓ Box {box_id} placed at layer {layer} | "
+                          f"τ={np.round(tau,3)}")
+                self._log(f"  [Slot {i}] Stability check PASSED. Moving away to park...")
+                self.grasp_timer[i] = 0.0
+                
                 box.carried_by = i
                 self._log(f"  [Slot {i}] Grasped {box_id} | τ={np.round(tau,3)}")
                 self.pb_fsm[i]    = PuzzleBotFSM.CARRYING
@@ -488,7 +530,7 @@ class Coordinator:
         # ── CARRYING: navigate to stack zone ─────────────────────────────────
         elif fsm == PuzzleBotFSM.CARRYING:
             other_bots = [b for idx, b in enumerate(self.puzzlebots) if idx != i]
-            safe_target = self._get_avoidance_target(bot, self.stack_target, other_bots, safe_dist=0.4)
+            safe_target = self._get_avoidance_target(bot, self.stack_target, other_bots, safe_dist=0.1, containment_zone=self.stack_zone)
             
             arrived = bot.navigate_to(safe_target, dt)
             bot.step(dt)
@@ -521,9 +563,25 @@ class Coordinator:
                 box.carried_by = None
                 bot.arm.home()
                 self.pb_fsm[i] = PuzzleBotFSM.DONE
+                self.pb_fsm[i] = PuzzleBotFSM.PARKING
                 self._log(f"  [Slot {i}] ✓ Box {box_id} placed at layer {layer} | "
                           f"τ={np.round(tau,3)}")
-                # Unlock next time-slot
+                self._log(f"  [Slot {i}] Moving away to park...")
+                self.grasp_timer[i] = 0.0
+                
+        elif fsm == PuzzleBotFSM.PARKING:
+            park_pos = self.anymal_dest + self.DEPLOY_OFFSETS[i]
+            
+            obstacles = [b for idx, b in enumerate(self.puzzlebots) if idx != i] + self.stack_boxes
+            safe_target = self._get_avoidance_target(bot, park_pos, obstacles, safe_dist=0.1, containment_zone=self.stack_zone)
+            
+            arrived = bot.navigate_to(safe_target, dt)
+            bot.step(dt)
+            
+            if arrived:
+                self.pb_fsm[i] = PuzzleBotFSM.DONE
+                self._log(f"  [Slot {i}] ✓ Parked safely out of the way.")
+                
                 self.active_stacker += 1
                 if self.active_stacker < 3:
                     nxt = self.pb_assignment[self.active_stacker]
@@ -542,32 +600,125 @@ class Coordinator:
                                       + off[0]*np.sin(th) + off[1]*np.cos(th))
         self.puzzlebots[i].pose[2] = th
         
-    def _get_avoidance_target(self, robot, true_target, obstacles, safe_dist=0.7, k_rep=0.4):
-        """Calculates a virtual target using Artificial Potential Fields."""
+    def _get_avoidance_target(self, robot, true_target, obstacles, safe_dist=0.3, k_rep=0.4 , containment_zone=None):
+        """Calculates a virtual target using Area-Aware Artificial Potential Fields with Vortex."""
         rx, ry = robot.x, robot.y
         tx, ty = true_target[0], true_target[1]
+        
+        # Use the actual physical boundaries of the robot
+        robot_bounds = robot.get_bounds()
         
         # 1. Attractive vector towards the true target
         dx, dy = tx - rx, ty - ry
         dist_t = norm2(dx, dy)
+        
+        if dist_t < 0.25:
+            return [tx, ty]
         
         if dist_t > 0:
             scale = min(1.0, dist_t)
             dx = (dx / dist_t) * scale
             dy = (dy / dist_t) * scale
             
-            # 2. Repulsive vectors away from obstacles
-            rep_x, rep_y = 0.0, 0.0
-            for obs in obstacles:
-                ox, oy = obs.x, obs.y
-                dist_o = norm2(rx - ox, ry - oy)
-                if 0.01 < dist_o < safe_dist:
-                    mag = k_rep * (1.0 / dist_o - 1.0 / safe_dist) / (dist_o**2)
-                    rep_x += mag * (rx - ox) / dist_o
-                    rep_y += mag * (ry - oy) / dist_o
+        # 2. Repulsive vectors away from obstacles
+        rep_x, rep_y = 0.0, 0.0
+        has_bounds = hasattr(robot, 'get_bounds')
+        
+        rep_x, rep_y = 0.0, 0.0
+        for obs in obstacles:
+            # Measure true edge-to-edge physical distance, not centers!
+            if has_bounds:
+                robot_bounds = robot.get_bounds()
+                dist_o = get_aabb_distance(robot_bounds, obs.get_bounds())
+            else:
+                dist_o = norm2(rx - obs.x, ry - obs.y)
+            
+            if 0.01 < dist_o < safe_dist:
+                mag = k_rep * (1.0 / dist_o - 1.0 / safe_dist) / (dist_o**2)
+                
+                mag *= min(1.0, (dist_t / safe_dist))
+                
+                # Direction vector from obstacle center to robot center
+                dir_x = rx - obs.x
+                dir_y = ry - obs.y
+                dir_dist = norm2(dir_x, dir_y)
+                
+                if dir_dist > 0:
+                    r_x = (dir_x / dir_dist) * mag
+                    r_y = (dir_y / dir_dist) * mag
+                    
+                    # Standard repulsion (pushes away)
+                    rep_x += r_x
+                    rep_y += r_y
+                    
+                    # VORTEX Force: Rotates the repulsion 90 degrees so the robot "slides" around
+                    rep_x += -r_y 
+                    rep_y += r_x
+                    
+        if containment_zone:
+            min_x, min_y, max_x, max_y = containment_zone.get_bounds()
+            wall_safe_dist = 0.05  # Empieza a repeler a 40cm del borde
+            k_wall = 1.0          # Fuerza mucho más grande que los obstáculos normales
+            
+            # Pared Izquierda (Empuja hacia +X)
+            d_left = rx - min_x
+            if 0 < d_left < wall_safe_dist:
+                rep_x += k_wall * (1.0 / d_left - 1.0 / wall_safe_dist) / (d_left**2)
+                
+            # Pared Derecha (Empuja hacia -X)
+            d_right = max_x - rx
+            if 0 < d_right < wall_safe_dist:
+                rep_x -= k_wall * (1.0 / d_right - 1.0 / wall_safe_dist) / (d_right**2)
+                
+            # Pared Inferior (Empuja hacia +Y)
+            d_bot = ry - min_y
+            if 0 < d_bot < wall_safe_dist:
+                rep_y += k_wall * (1.0 / d_bot - 1.0 / wall_safe_dist) / (d_bot**2)
+                
+            # Pared Superior (Empuja hacia -Y)
+            d_top = max_y - ry
+            if 0 < d_top < wall_safe_dist:
+                rep_y -= k_wall * (1.0 / d_top - 1.0 / wall_safe_dist) / (d_top**2)
 
-        # 3. Combine vectors to create a new virtual waypoint
-        return [rx + dx + rep_x, ry + dy + rep_y] 
+        v_x = dx + rep_x
+        v_y = dy + rep_y
+        
+        # 3. Anti-freeze escape: If forces cancel perfectly, shove the robot sideways
+        if norm2(v_x, v_y) < 0.05:
+            v_x += 0.5
+            v_y += 0.5
+
+        # Return the new virtual waypoint
+        return [rx + v_x, ry + v_y]
+    
+    def check_stack_stability(self) -> bool:
+        """
+        Verifies that the stack is physically stable.
+        Requirement: The center of mass (x,y) of layer N must fall 
+        within the support polygon (w, h) of layer N-1.
+        """
+        # Obtener solo las cajas apiladas y ordenarlas por capa (0, 1, 2)
+        stacked_boxes = sorted([b for b in self.stack_boxes if b.stacked], 
+                               key=lambda b: b.stack_layer)
+        
+        # Una torre de 0 o 1 caja siempre es estable
+        if len(stacked_boxes) <= 1:
+            return True 
+            
+        for i in range(1, len(stacked_boxes)):
+            top_box = stacked_boxes[i]
+            bot_box = stacked_boxes[i-1]
+            
+            # Calcular la desviación entre los centros de las cajas
+            dx = abs(top_box.x - bot_box.x)
+            dy = abs(top_box.y - bot_box.y)
+            
+            if dx > (bot_box.w / 2.0) or dy > (bot_box.h / 2.0):
+                self._log(f"⚠️ ALERTA DE ESTABILIDAD: La caja {top_box.id} "
+                          f"excedió el margen de soporte de la caja {bot_box.id}.")
+                return False
+                
+        return True
 
     # ── STATUS ────────────────────────────────────────────────────────────────
 
